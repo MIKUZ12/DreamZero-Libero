@@ -342,6 +342,73 @@ transform_yam:
     - ${model_specific_transform}
 
 ################################################################################
+# libero_sim (LIBERO sim: 2 views, joint state + 7D OSC pose action)
+################################################################################
+
+modality_config_libero_sim:
+  video:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+    eval_delta_indices: [0]
+    modality_keys:
+      - video.agentview_rgb
+      - video.eye_in_hand_rgb
+  state:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - state.joint_position
+      - state.gripper_position
+  action:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    modality_keys:
+      - action.pose_delta
+      - action.gripper_position
+  language:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - annotation.language.language_instruction
+
+transform_libero_sim:
+  _target_: groot.vla.data.transform.ComposedModalityTransform
+  transforms:
+    - <<: *totensor_cfg
+      apply_to: ${modality_config_libero_sim.video.modality_keys}
+    - <<: *crop_cfg
+      apply_to: ${modality_config_libero_sim.video.modality_keys}
+    - <<: *resize_cfg_single_frame
+      apply_to: ${modality_config_libero_sim.video.modality_keys}
+    - <<: *color_jitter_cfg
+      apply_to: ${modality_config_libero_sim.video.modality_keys}
+    - <<: *to_numpy_cfg
+      apply_to: ${modality_config_libero_sim.video.modality_keys}
+
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_libero_sim.state.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_libero_sim.state.modality_keys}
+      normalization_modes:
+        state.joint_position: q99
+        state.gripper_position: q99
+
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_libero_sim.action.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_libero_sim.action.modality_keys}
+      normalization_modes:
+        action.pose_delta: q99
+        action.gripper_position: q99
+
+    - _target_: groot.vla.data.transform.ConcatTransform
+      video_concat_order: ${modality_config_libero_sim.video.modality_keys}
+      state_concat_order: ${modality_config_libero_sim.state.modality_keys}
+      action_concat_order: ${modality_config_libero_sim.action.modality_keys}
+
+    - ${model_specific_transform}
+
+################################################################################
 # Modality Configs
 ################################################################################
 
@@ -349,6 +416,7 @@ modality_configs:
   oxe_droid: ${modality_config_oxe_droid}
   agibot: ${modality_config_agibot}
   yam: ${modality_config_yam}
+  libero_sim: ${modality_config_libero_sim}
 
 ################################################################################
 # Transforms
@@ -358,6 +426,7 @@ transforms:
   oxe_droid: ${transform_oxe_droid}
   agibot: ${transform_agibot}
   yam: ${transform_yam}
+  libero_sim: ${transform_libero_sim}
 
 ################################################################################
 # Metadata Versions
@@ -367,6 +436,7 @@ metadata_versions:
   oxe_droid: '0221'
   agibot: '0221'
   yam: '0221'
+  libero_sim: '0221'
 
 ################################################################################
 # FPS (per embodiment, null means use dataset default)
@@ -374,3 +444,4 @@ metadata_versions:
 
 fps:
   yam: 30
+  libero_sim: 20

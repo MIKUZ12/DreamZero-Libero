@@ -80,6 +80,7 @@ eval_bf16: true
 torch_compile_mode: null
 
 pretrained_model_path: null
+reset_libero_heads: false
 only_tune_projectors: false
 
 save_llm: false

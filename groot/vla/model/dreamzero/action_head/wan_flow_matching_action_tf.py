@@ -44,6 +44,10 @@ from transformers.feature_extraction_utils import BatchFeature
 
 from groot.vla.model.n1_5.action_head.base_action_head import ActionHead
 from groot.vla.model.dreamzero.modules.flow_match_scheduler import FlowMatchScheduler
+from groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk import (
+    CategorySpecificMLP,
+    MultiEmbodimentActionEncoder,
+)
 from groot.vla.model.dreamzero.modules.vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
 from groot.vla.model.dreamzero.modules.wan_video_text_encoder import T5RelativeEmbedding, T5LayerNorm
 from groot.vla.model.dreamzero.modules.flow_unipc_multistep_scheduler import FlowUniPCMultistepScheduler
@@ -400,6 +404,38 @@ class WANPolicyHead(ActionHead):
         else:
             print("LoRA injection not needed (train_architecture != 'lora')")
 
+    def reset_small_heads_for_libero(self):
+        """Reinitialize the embodiment-shared state/action heads for LIBERO continued training."""
+        action_model = self.model
+        num_categories = 1
+
+        print("Resetting LIBERO small heads before LoRA injection")
+        print(
+            "Reset dimensions:",
+            f"max_state_dim={action_model.max_state_dim}",
+            f"action_dim={action_model.action_dim}",
+            f"hidden_size={action_model.hidden_size}",
+            f"dim={action_model.dim}",
+        )
+
+        action_model.state_encoder = CategorySpecificMLP(
+            num_categories=num_categories,
+            input_dim=action_model.max_state_dim,
+            hidden_dim=action_model.hidden_size,
+            output_dim=action_model.dim,
+        )
+        action_model.action_encoder = MultiEmbodimentActionEncoder(
+            action_dim=action_model.action_dim,
+            hidden_size=action_model.dim,
+            num_embodiments=num_categories,
+        )
+        action_model.action_decoder = CategorySpecificMLP(
+            num_categories=num_categories,
+            input_dim=action_model.dim,
+            hidden_dim=action_model.hidden_size,
+            output_dim=action_model.action_dim,
+        )
+
     def set_frozen_modules_to_eval_mode(self):
         """
         Huggingface will call model.train() at each training_step. To ensure
@@ -603,8 +639,6 @@ class WANPolicyHead(ActionHead):
         videos = data["images"]
 
         videos = rearrange(videos, "b t h w c -> b c t h w")
-        print("videos", videos.shape)
-        
 
         if videos.dtype == torch.uint8:
             videos = videos.float() / 255.0
@@ -683,14 +717,16 @@ class WANPolicyHead(ActionHead):
             
             # Log noise mode once
             if not self._noise_logged:
-                video_mean = timestep_id.float().mean().item()
-                action_mean = timestep_action_id.float().mean().item()
-                if noise_mode == "DECOUPLED":
-                    print(f"[NOISE] Mode={noise_mode} | Video: Beta({self.config.video_noise_beta_alpha},1) mean_t={video_mean:.0f} | Action: {action_mode} Uniform mean_t={action_mean:.0f}")
-                elif noise_mode == "HIGH_NOISE_EMPHASIS":
-                    print(f"[NOISE] Mode={noise_mode} | Video+Action: Beta({self.config.high_noise_beta_alpha},1) mean_t={video_mean:.0f} | Action: {action_mode}")
-                else:
-                    print(f"[NOISE] Mode={noise_mode} | Video+Action: Uniform mean_t={video_mean:.0f} | Action: {action_mode}")
+                should_log_noise = not dist.is_initialized() or dist.get_rank() == 0
+                if should_log_noise:
+                    video_mean = timestep_id.float().mean().item()
+                    action_mean = timestep_action_id.float().mean().item()
+                    if noise_mode == "DECOUPLED":
+                        print(f"[NOISE] Mode={noise_mode} | Video: Beta({self.config.video_noise_beta_alpha},1) mean_t={video_mean:.0f} | Action: {action_mode} Uniform mean_t={action_mean:.0f}")
+                    elif noise_mode == "HIGH_NOISE_EMPHASIS":
+                        print(f"[NOISE] Mode={noise_mode} | Video+Action: Beta({self.config.high_noise_beta_alpha},1) mean_t={video_mean:.0f} | Action: {action_mode}")
+                    else:
+                        print(f"[NOISE] Mode={noise_mode} | Video+Action: Uniform mean_t={video_mean:.0f} | Action: {action_mode}")
                 self._noise_logged = True
         else:
             noise_action = None
@@ -965,28 +1001,48 @@ class WANPolicyHead(ActionHead):
         state_features = state_features.to(dtype=torch.bfloat16)
         videos = videos.to(dtype=torch.bfloat16)
 
+        debug_infer = os.environ.get("DREAMZERO_DEBUG_INFER", "0") == "1"
+
         if self.language is None:
-            print("language is None, reset current_start_frame to 0")
+            if self.ip_rank == 0 and debug_infer:
+                print("[action_head][reset] reason=language_uninitialized current_start_frame->0")
             self.language = data["text"]
             self.current_start_frame = 0
         elif not torch.equal(self.language, data["text"]):
-            print("language changed, reset current_start_frame to 0")
+            if self.ip_rank == 0 and debug_infer:
+                print("[action_head][reset] reason=language_changed current_start_frame->0")
             self.current_start_frame = 0
             self.language = data["text"]
         elif videos.shape[2] == 1:
-            print("videos.shape[2] == 1, reset current_start_frame to 0")
+            if self.ip_rank == 0 and debug_infer:
+                print(
+                    f"[action_head][reset] reason=single_frame_input "
+                    f"video_t={videos.shape[2]} configured_num_frames={self.num_frames} "
+                    "current_start_frame->0"
+                )
             self.current_start_frame = 0
         elif self.current_start_frame >= self.model.local_attn_size:
-            print("current_start_frame >= local_attn_size, reset current_start_frame to 0")
+            if self.ip_rank == 0 and debug_infer:
+                print(
+                    f"[action_head][reset] reason=local_attn_window_exhausted "
+                    f"current_start_frame={self.current_start_frame} "
+                    f"local_attn_size={self.model.local_attn_size} current_start_frame->0"
+                )
             self.current_start_frame = 0
 
-        if self.ip_rank == 0:
+        if self.ip_rank == 0 and debug_infer:
             print("videos shape", videos.shape, self.num_frames)
 
         start_text_encoder_event.record()
 
         text_inputs = self._prepare_text_inputs(data)
+        stage_after_prepare_text = time.perf_counter()
+        if self.ip_rank == 0 and debug_infer:
+            print(f"[timing] prepare_text_inputs: {stage_after_prepare_text - start_time:.2f}s")
         prompt_embs = [self.encode_prompt(text, attention_mask) for text, attention_mask in text_inputs]
+        stage_after_text_encoder = time.perf_counter()
+        if self.ip_rank == 0 and debug_infer:
+            print(f"[timing] text_encoder_done: {stage_after_text_encoder - start_time:.2f}s")
 
         end_text_encoder_event.record()
         
@@ -1003,6 +1059,9 @@ class WANPolicyHead(ActionHead):
             clip_feas, ys, image = self.encode_image(image, self.num_frames, height, width)
             self.clip_feas = clip_feas.to(dtype=image.dtype)
             self.ys = ys.to(dtype=image.dtype)
+        stage_after_image_encoder = time.perf_counter()
+        if self.ip_rank == 0 and debug_infer:
+            print(f"[timing] image_encoder_done: {stage_after_image_encoder - start_time:.2f}s")
         
         assert self.clip_feas is not None and self.ys is not None, "clip_feas and ys must be set"
 
@@ -1035,6 +1094,9 @@ class WANPolicyHead(ActionHead):
                 tile_size=(self.tile_size_height, self.tile_size_width),
                 tile_stride=(self.tile_stride_height, self.tile_stride_width),
             )
+        stage_after_vae = time.perf_counter()
+        if self.ip_rank == 0 and debug_infer:
+            print(f"[timing] vae_done: {stage_after_vae - start_time:.2f}s")
 
         end_vae_event.record()
 
@@ -1096,6 +1158,9 @@ class WANPolicyHead(ActionHead):
                 ),
             )
             self.current_start_frame += 1
+        stage_after_kv_prefill = time.perf_counter()
+        if self.ip_rank == 0 and debug_infer:
+            print(f"[timing] kv_prefill_done: {stage_after_kv_prefill - start_time:.2f}s")
             
         timestep = torch.ones([batch_size, self.num_frame_per_block], device=noise_obs.device, dtype=torch.int64) * 0
 
@@ -1238,6 +1303,9 @@ class WANPolicyHead(ActionHead):
                 step_index=index,
                 return_dict=False,
             )[0]
+        stage_after_diffusion = time.perf_counter()
+        if self.ip_rank == 0 and debug_infer:
+            print(f"[timing] diffusion_loop_done: {stage_after_diffusion - start_time:.2f}s")
 
         latents = noisy_input
         latents_action = noisy_input_action
@@ -1260,7 +1328,7 @@ class WANPolicyHead(ActionHead):
         diffusion_time = sum(diffusion_times) / 1000
         scheduler_time = total_time - kv_creation_time - diffusion_time - text_encoder_time - image_encoder_time - vae_time
 
-        if self.ip_rank == 0:
+        if self.ip_rank == 0 and debug_infer:
             print(f"Time taken: Total {total_time:.2f} seconds, "
                   f"Text Encoder {text_encoder_time:.2f} seconds, "
                   f"Image Encoder {image_encoder_time:.2f} seconds, "

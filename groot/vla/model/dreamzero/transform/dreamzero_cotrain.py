@@ -91,6 +91,7 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
         if key == "text":
             output_values = []
             for elem in features:
+                embodiment_id = elem["embodiment_id"]
                 item = elem[key]
                 try:
                     parsed_item = ast.literal_eval(item)
@@ -100,46 +101,76 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                     else:
                         # If it's already a scalar (string, float, int, etc.), convert to string
                         processed_item = str(parsed_item)
-                    
-                    if num_views > 1 and elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.AGIBOT.value]:
+
+                    agibot_id = embodiment_tag_mapping.get(EmbodimentTag.AGIBOT.value) if embodiment_tag_mapping else None
+                    oxe_droid_id = embodiment_tag_mapping.get(EmbodimentTag.OXE_DROID.value) if embodiment_tag_mapping else None
+                    gr1_unified_id = embodiment_tag_mapping.get(EmbodimentTag.GR1_UNIFIED.value) if embodiment_tag_mapping else None
+                    mecka_hands_id = embodiment_tag_mapping.get(EmbodimentTag.MECKA_HANDS.value) if embodiment_tag_mapping else None
+                    xdof_id = embodiment_tag_mapping.get(EmbodimentTag.XDOF.value) if embodiment_tag_mapping else None
+                    yam_id = embodiment_tag_mapping.get(EmbodimentTag.YAM.value) if embodiment_tag_mapping else None
+                    libero_sim_id = embodiment_tag_mapping.get(EmbodimentTag.LIBERO_SIM.value) if embodiment_tag_mapping else None
+
+                    if num_views > 1 and agibot_id is not None and embodiment_id == agibot_id:
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + processed_item.lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OXE_DROID.value]:
+                    elif oxe_droid_id is not None and embodiment_id == oxe_droid_id:
                         processed_item = (
                             "A multi-view video shows that a robot "
                             + processed_item.lower()
                             + " The video is split into three views: The top view shows the camera view from the robot's wrist, the bottom-left view shows the camera view from the left exterior camera, and the bottom-right view shows the camera view from the right exterior camera. During training, one of the two bottom exterior views may be a black screen (dropped view). The robot "
                             + processed_item.lower()
                         )
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.GR1_UNIFIED.value]:
+                    elif gr1_unified_id is not None and embodiment_id == gr1_unified_id:
                         processed_item = "A single view video shows that a human " + processed_item.lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.MECKA_HANDS.value]:
+                    elif mecka_hands_id is not None and embodiment_id == mecka_hands_id:
                         processed_item = "A single view video shows that a human " + processed_item.lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.XDOF.value]:
+                    elif xdof_id is not None and embodiment_id == xdof_id:
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + processed_item.lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
+                    elif yam_id is not None and embodiment_id == yam_id:
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + processed_item.lower()
+                    elif libero_sim_id is not None and embodiment_id == libero_sim_id:
+                        processed_item = (
+                            "A multi-view video shows that a robot "
+                            + processed_item.lower()
+                            + " The video is split into two views: The first view shows a static scene camera, and the second view shows the camera view from the robot's wrist. The robot "
+                            + processed_item.lower()
+                        )
                     else:
                         raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.") 
                     output_values.append(processed_item)  
                 except (ValueError, SyntaxError, TypeError):
                     # If parsing fails or item is already a string, use it directly
-                    if num_views > 1 and elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.AGIBOT.value]:
+                    agibot_id = embodiment_tag_mapping.get(EmbodimentTag.AGIBOT.value) if embodiment_tag_mapping else None
+                    oxe_droid_id = embodiment_tag_mapping.get(EmbodimentTag.OXE_DROID.value) if embodiment_tag_mapping else None
+                    gr1_unified_id = embodiment_tag_mapping.get(EmbodimentTag.GR1_UNIFIED.value) if embodiment_tag_mapping else None
+                    mecka_hands_id = embodiment_tag_mapping.get(EmbodimentTag.MECKA_HANDS.value) if embodiment_tag_mapping else None
+                    xdof_id = embodiment_tag_mapping.get(EmbodimentTag.XDOF.value) if embodiment_tag_mapping else None
+                    yam_id = embodiment_tag_mapping.get(EmbodimentTag.YAM.value) if embodiment_tag_mapping else None
+                    libero_sim_id = embodiment_tag_mapping.get(EmbodimentTag.LIBERO_SIM.value) if embodiment_tag_mapping else None
+
+                    if num_views > 1 and agibot_id is not None and embodiment_id == agibot_id:
                         item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + str(item).lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OXE_DROID.value]:
+                    elif oxe_droid_id is not None and embodiment_id == oxe_droid_id:
                         item = (
                             "A multi-view video shows that a robot "
                             + str(item).lower()
                             + " The video is split into three views: The top view shows the camera view from the robot's wrist, the bottom-left view shows the camera view from the left exterior camera, and the bottom-right view shows the camera view from the right exterior camera. During training, one of the two bottom exterior views may be a black screen (dropped view). The robot "
                             + str(item).lower()
                         )
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.GR1_UNIFIED.value]:
+                    elif gr1_unified_id is not None and embodiment_id == gr1_unified_id:
                         item = "A single view video shows that a human " + str(item).lower() 
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.MECKA_HANDS.value]:
+                    elif mecka_hands_id is not None and embodiment_id == mecka_hands_id:
                         item = "A single view video shows that a human " + str(item).lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.XDOF.value]:
+                    elif xdof_id is not None and embodiment_id == xdof_id:
                         item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + str(item).lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
+                    elif yam_id is not None and embodiment_id == yam_id:
                         item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + str(item).lower()
+                    elif libero_sim_id is not None and embodiment_id == libero_sim_id:
+                        item = (
+                            "A multi-view video shows that a robot "
+                            + str(item).lower()
+                            + " The video is split into two views: The first view shows a static scene camera, and the second view shows the camera view from the robot's wrist. The robot "
+                            + str(item).lower()
+                        )
                     else:
                         raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.")   
                     output_values.append(item)
@@ -621,4 +652,3 @@ class DreamTransform(InvertibleModalityTransform):
 
     def __call__(self, data: dict) -> dict:
         return self.apply(data)
-

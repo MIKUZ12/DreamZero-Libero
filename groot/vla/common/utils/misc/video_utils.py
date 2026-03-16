@@ -31,7 +31,7 @@ def _get_video_info_ffmpeg(video_path: str) -> dict:
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=nb_frames,duration,r_frame_rate",
+        "stream=nb_frames,duration,r_frame_rate,width,height",
         "-of",
         "json",
         video_path,
@@ -61,6 +61,8 @@ def _get_video_info_ffmpeg(video_path: str) -> dict:
             "nb_frames": nb_frames,
             "fps": fps,
             "duration": duration,
+            "width": int(stream["width"]),
+            "height": int(stream["height"]),
         }
     except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as e:
         raise ValueError(f"Failed to get video info for {video_path}: {e}")
@@ -68,9 +70,16 @@ def _get_video_info_ffmpeg(video_path: str) -> dict:
 
 def _extract_frames_ffmpeg(video_path: str, frame_indices: list[int]) -> np.ndarray:
     """Extract specific frames using ffmpeg."""
+    info = _get_video_info_ffmpeg(video_path)
+    width = info["width"]
+    height = info["height"]
+    max_frame_index = max(info["nb_frames"] - 1, 0) if info["nb_frames"] > 0 else None
     frames = []
 
     for idx in frame_indices:
+        if max_frame_index is not None:
+            idx = min(max(idx, 0), max_frame_index)
+
         # Use ffmpeg to extract a specific frame
         cmd = [
             "ffmpeg",
@@ -96,102 +105,38 @@ def _extract_frames_ffmpeg(video_path: str, frame_indices: list[int]) -> np.ndar
             if len(output) == 0:
                 raise subprocess.CalledProcessError(1, cmd)
 
-            # Get frame dimensions by probing first
-            if len(frames) == 0:
-                info_cmd = [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "v:0",
-                    "-show_entries",
-                    "stream=width,height",
-                    "-of",
-                    "json",
-                    video_path,
-                ]
-                info_output = subprocess.check_output(info_cmd).decode("utf-8")
-                info_data = json.loads(info_output)
-                width = info_data["streams"][0]["width"]
-                height = info_data["streams"][0]["height"]
-
             # Decode raw RGB data
             frame_data = np.frombuffer(output, dtype=np.uint8)
             frame = frame_data.reshape((height, width, 3))
             frames.append(frame)
 
         except subprocess.CalledProcessError:
-            # Frame might not exist, create a black frame
+            # Frame might not exist, reuse the closest previous frame if available.
             if len(frames) > 0:
-                frames.append(np.zeros_like(frames[0]))
+                frames.append(frames[-1].copy())
             else:
-                # Default fallback frame
-                frames.append(np.zeros((480, 640, 3), dtype=np.uint8))
+                frames.append(np.zeros((height, width, 3), dtype=np.uint8))
 
     return np.array(frames)
 
 
 def _extract_frames_at_timestamps_ffmpeg(video_path: str, timestamps: list[float]) -> np.ndarray:
     """Extract frames at specific timestamps using ffmpeg."""
-    frames = []
+    info = _get_video_info_ffmpeg(video_path)
+    fps = info["fps"]
+    nb_frames = info["nb_frames"]
 
-    for timestamp in timestamps:
-        cmd = [
-            "ffmpeg",
-            "-ss",
-            str(timestamp),
-            "-i",
-            video_path,
-            "-vframes",
-            "1",
-            "-f",
-            "image2pipe",
-            "-pix_fmt",
-            "rgb24",
-            "-vcodec",
-            "rawvideo",
-            "-",
-        ]
+    timestamp_array = np.asarray(timestamps, dtype=np.float64)
+    if timestamp_array.size == 0:
+        return np.zeros((0, info["height"], info["width"], 3), dtype=np.uint8)
 
-        try:
-            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+    frame_indices = np.rint(timestamp_array * fps).astype(np.int64)
+    if nb_frames > 0:
+        frame_indices = np.clip(frame_indices, 0, nb_frames - 1)
+    else:
+        frame_indices = np.maximum(frame_indices, 0)
 
-            # Check if output is empty (timestamp doesn't exist)
-            if len(output) == 0:
-                raise subprocess.CalledProcessError(1, cmd)
-
-            # Get frame dimensions
-            if len(frames) == 0:
-                info_cmd = [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "v:0",
-                    "-show_entries",
-                    "stream=width,height",
-                    "-of",
-                    "json",
-                    video_path,
-                ]
-                info_output = subprocess.check_output(info_cmd).decode("utf-8")
-                info_data = json.loads(info_output)
-                width = info_data["streams"][0]["width"]
-                height = info_data["streams"][0]["height"]
-
-            # Decode raw RGB data
-            frame_data = np.frombuffer(output, dtype=np.uint8)
-            frame = frame_data.reshape((height, width, 3))
-            frames.append(frame)
-
-        except subprocess.CalledProcessError:
-            # Timestamp might be out of bounds, use last frame or black frame
-            if len(frames) > 0:
-                frames.append(frames[-1])
-            else:
-                frames.append(np.zeros((480, 640, 3), dtype=np.uint8))
-
-    return np.array(frames)
+    return _extract_frames_ffmpeg(video_path, frame_indices.tolist())
 
 
 def _extract_all_frames_ffmpeg(video_path: str) -> tuple[np.ndarray, np.ndarray]:

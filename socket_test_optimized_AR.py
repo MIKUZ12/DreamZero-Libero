@@ -264,9 +264,16 @@ class ARDroidRoboarenaPolicy:
         
         self._msg_index += 1
         self._call_count += 1
+        infer_start = time.perf_counter()
         
         # Convert observation format
         converted_obs = self._convert_observation(obs)
+        convert_done = time.perf_counter()
+        logger.info(
+            "Infer[%d] convert_observation took %.2fs",
+            self._msg_index,
+            convert_done - infer_start,
+        )
         
         # Signal workers to continue (0 = continue)
         signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
@@ -274,15 +281,41 @@ class ARDroidRoboarenaPolicy:
         
         # Broadcast obs to workers
         self._broadcast_batch_to_workers(converted_obs)
+        broadcast_done = time.perf_counter()
+        logger.info(
+            "Infer[%d] worker broadcast took %.2fs",
+            self._msg_index,
+            broadcast_done - convert_done,
+        )
         
         # Create batch for policy
         batch = Batch(obs=converted_obs)
         
         # Distributed forward pass
+        logger.info("Infer[%d] entering pre-forward barrier", self._msg_index)
         dist.barrier()
+        pre_barrier_done = time.perf_counter()
+        logger.info(
+            "Infer[%d] pre-forward barrier took %.2fs",
+            self._msg_index,
+            pre_barrier_done - broadcast_done,
+        )
         with torch.no_grad():
             result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
+        forward_done = time.perf_counter()
+        logger.info(
+            "Infer[%d] policy forward returned in %.2fs",
+            self._msg_index,
+            forward_done - pre_barrier_done,
+        )
+        logger.info("Infer[%d] entering post-forward barrier", self._msg_index)
         dist.barrier()
+        post_barrier_done = time.perf_counter()
+        logger.info(
+            "Infer[%d] post-forward barrier took %.2fs",
+            self._msg_index,
+            post_barrier_done - forward_done,
+        )
         
         # Store video predictions for potential saving
         self.video_across_time.append(video_pred)
@@ -301,6 +334,11 @@ class ARDroidRoboarenaPolicy:
         # Update first call flag
         if self._is_first_call:
             self._is_first_call = False
+        logger.info(
+            "Infer[%d] total server handling time %.2fs",
+            self._msg_index,
+            time.perf_counter() - infer_start,
+        )
         
         return action
     

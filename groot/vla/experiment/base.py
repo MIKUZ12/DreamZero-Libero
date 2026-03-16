@@ -80,6 +80,37 @@ LAYERNORM_LAYERS = [
 ]
 
 
+def _summarize_checkpoint_keys(keys: set[str], limit: int = 20) -> str:
+    if not keys:
+        return "[]"
+    sample = sorted(keys)[:limit]
+    suffix = "" if len(keys) <= limit else f" ... (+{len(keys) - limit} more)"
+    return f"{sample}{suffix}"
+
+
+def _load_checkpoint_subset(model, state_dict: dict[str, torch.Tensor]) -> tuple[set[str], set[str], set[str]]:
+    expected_state = model.state_dict()
+    compatible_state: dict[str, torch.Tensor] = {}
+    compatible_keys: set[str] = set()
+    unexpected_keys: set[str] = set()
+    shape_mismatch_keys: set[str] = set()
+
+    for key, value in state_dict.items():
+        if key not in expected_state:
+            unexpected_keys.add(key)
+            continue
+        if expected_state[key].shape != value.shape:
+            shape_mismatch_keys.add(key)
+            continue
+        compatible_state[key] = value
+        compatible_keys.add(key)
+
+    if compatible_state:
+        model.load_state_dict(compatible_state, strict=False)
+
+    return compatible_keys, unexpected_keys, shape_mismatch_keys
+
+
 class LossLoggerCallback(TrainerCallback):
     """Callback that writes per-step loss metrics to a JSONL file for offline analysis."""
 
@@ -690,6 +721,9 @@ class BaseExperiment(ABC):
         self.trainer = trainer
 
     def create_model(self, cfg, training_args):
+        if cfg.reset_libero_heads and cfg.pretrained_model_path is None:
+            raise ValueError("reset_libero_heads=true requires pretrained_model_path to be set.")
+
         model = instantiate(cfg.model)
 
         if cfg.pretrained_model_path is not None:
@@ -700,6 +734,9 @@ class BaseExperiment(ABC):
             ckpt_dir = cfg.pretrained_model_path
             safetensors_index_path = os.path.join(ckpt_dir, "model.safetensors.index.json")
             safetensors_path = os.path.join(ckpt_dir, "model.safetensors")
+            loaded_keys: set[str] = set()
+            unexpected_keys: set[str] = set()
+            shape_mismatch_keys: set[str] = set()
 
             if os.path.exists(safetensors_index_path):
                 with open(safetensors_index_path, 'r') as f:
@@ -708,17 +745,52 @@ class BaseExperiment(ABC):
                     shard_path = os.path.join(ckpt_dir, shard_file)
                     mprint(f"Loading shard: {shard_path}")
                     shard_state_dict = load_file(shard_path)
-                    model.load_state_dict(shard_state_dict, strict=False)
+                    shard_loaded_keys, shard_unexpected_keys, shard_shape_mismatch_keys = (
+                        _load_checkpoint_subset(model, shard_state_dict)
+                    )
+                    loaded_keys.update(shard_loaded_keys)
+                    unexpected_keys.update(shard_unexpected_keys)
+                    shape_mismatch_keys.update(shard_shape_mismatch_keys)
                     del shard_state_dict
                     gc.collect()
             elif os.path.exists(safetensors_path):
                 state_dict = load_file(safetensors_path)
-                model.load_state_dict(state_dict, strict=False)
+                file_loaded_keys, file_unexpected_keys, file_shape_mismatch_keys = (
+                    _load_checkpoint_subset(model, state_dict)
+                )
+                loaded_keys.update(file_loaded_keys)
+                unexpected_keys.update(file_unexpected_keys)
+                shape_mismatch_keys.update(file_shape_mismatch_keys)
             else:
                 raise FileNotFoundError(
                     f"No weights found at '{ckpt_dir}'. "
                     "Expected 'model.safetensors' or 'model.safetensors.index.json'."
                 )
+
+            missing_keys = set(model.state_dict().keys()) - loaded_keys
+            mprint(
+                "Checkpoint load summary: "
+                f"loaded={len(loaded_keys)} "
+                f"missing={len(missing_keys)} "
+                f"unexpected={len(unexpected_keys)} "
+                f"shape_mismatch={len(shape_mismatch_keys)}"
+            )
+            if missing_keys:
+                mprint(f"Missing keys: {_summarize_checkpoint_keys(missing_keys)}")
+            if unexpected_keys:
+                mprint(f"Unexpected keys: {_summarize_checkpoint_keys(unexpected_keys)}")
+            if shape_mismatch_keys:
+                mprint(f"Shape mismatch keys: {_summarize_checkpoint_keys(shape_mismatch_keys)}")
+
+            if cfg.reset_libero_heads:
+                if not hasattr(model, "action_head") or not hasattr(
+                    model.action_head, "reset_small_heads_for_libero"
+                ):
+                    raise AttributeError(
+                        "reset_libero_heads=true requires model.action_head.reset_small_heads_for_libero()."
+                    )
+                mprint("Resetting LIBERO small heads after pretrained load")
+                model.action_head.reset_small_heads_for_libero()
 
             if (hasattr(model, 'action_head')
                     and hasattr(model.action_head, 'inject_lora_after_loading')

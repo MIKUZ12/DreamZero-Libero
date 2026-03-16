@@ -42,3 +42,4 @@ model_specific_transform:
   action_horizon: ${action_horizon}
   embodiment_tag_mapping: ${embodiment_tag_to_projector_index}
   tokenizer_path: ${tokenizer_path}
+  num_views: ${num_views}

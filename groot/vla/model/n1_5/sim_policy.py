@@ -1,5 +1,6 @@
 import importlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -15,8 +16,52 @@ from torch.distributed.device_mesh import DeviceMesh
 import tree
 import time
 
+from groot.vla.data.dataset.lerobot import LeRobotSingleDataset
 from groot.vla.data.schema import DatasetMetadata, EmbodimentTag
 from groot.vla.data.transform import ComposedModalityTransform
+
+
+def _maybe_apply_embodiment_runtime_fallbacks(train_cfg, embodiment_tag: EmbodimentTag):
+    """Patch older checkpoint configs with locally-added embodiment definitions."""
+    emb = embodiment_tag.value
+    model_transform_base_cfg = OmegaConf.load(
+        Path(__file__).resolve().parents[2] / "configs" / "model" / "dreamzero" / "transform" / "base.yaml"
+    )
+
+    if "embodiment_tag_to_projector_index" not in train_cfg:
+        train_cfg.embodiment_tag_to_projector_index = OmegaConf.create({})
+    for key, value in model_transform_base_cfg.embodiment_tag_to_projector_index.items():
+        train_cfg.embodiment_tag_to_projector_index[key] = value
+
+    if "model_specific_transform" in train_cfg and "embodiment_tag_mapping" in train_cfg.model_specific_transform:
+        for key, value in model_transform_base_cfg.embodiment_tag_to_projector_index.items():
+            train_cfg.model_specific_transform.embodiment_tag_mapping[key] = value
+
+    if emb == "libero_sim" and emb not in train_cfg.modality_configs:
+        config_root = Path(__file__).resolve().parents[2] / "configs" / "data" / "dreamzero"
+        base_cfg = OmegaConf.load(config_root / "base_48_wan_fine_aug_relative.yaml")
+        libero_cfg = OmegaConf.load(config_root / "libero_spatial.yaml")
+
+        train_cfg.modality_config_libero_sim = base_cfg.modality_config_libero_sim
+        train_cfg.modality_configs.libero_sim = base_cfg.modality_configs.libero_sim
+        train_cfg.transforms.libero_sim = base_cfg.transforms.libero_sim
+
+        if "metadata_versions" not in train_cfg:
+            train_cfg.metadata_versions = OmegaConf.create({})
+        train_cfg.metadata_versions.libero_sim = base_cfg.metadata_versions.libero_sim
+
+        if "fps" not in train_cfg:
+            train_cfg.fps = OmegaConf.create({})
+        train_cfg.fps.libero_sim = base_cfg.fps.libero_sim
+
+        train_cfg.relative_action = libero_cfg.relative_action
+        train_cfg.relative_action_per_horizon = libero_cfg.relative_action_per_horizon
+        train_cfg.use_global_metadata = libero_cfg.use_global_metadata
+        train_cfg.max_chunk_size = libero_cfg.max_chunk_size
+
+        print("Applied runtime fallback config for libero_sim from local repo configs")
+
+    return train_cfg
 
 
 class ModelManager:
@@ -213,6 +258,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         skip_img_transform: bool = False,
         lazy_load: bool = False,
         device_mesh: DeviceMesh | None = None,
+        metadata_dataset_path: str | None = None,
     ):
         """
         Initialize the GrootSimPolicy.
@@ -223,6 +269,8 @@ class GrootSimPolicy(BaseGrootSimPolicy):
             device (int | str): Device to run the model on.
             lazy_load (bool): If True, don't load model to GPU immediately.
             device_mesh (DeviceMesh | None): Device mesh to parallelize the model across.
+            metadata_dataset_path (str | None): Optional converted dataset root used to build DatasetMetadata
+                when the checkpoint metadata does not contain the target embodiment.
         """
         super().__init__(embodiment_tag=embodiment_tag, model_path=model_path, device=device)
         model_dir = Path(model_path)
@@ -231,6 +279,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         exp_cfg_dir = model_dir / "experiment_cfg"
         train_cfg_path = exp_cfg_dir / "conf.yaml"
         train_cfg = OmegaConf.load(train_cfg_path)
+        train_cfg = _maybe_apply_embodiment_runtime_fallbacks(train_cfg, embodiment_tag)
         self.train_cfg = train_cfg
         self.lazy_load = lazy_load
 
@@ -333,12 +382,39 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         # We have an assumption: one policy is only for rolling out one type of env, i.e., one embodiment_tag
         # metadata_versions = train_cfg.metadata_versions
         # metadata = get_metadata(self.embodiment_tag, metadata_versions[self.embodiment_tag.value])
-        metadata_path = exp_cfg_dir / "metadata.json"
-        with open(metadata_path, "r") as f:
-            metadatas = json.load(f)
-        if "gr1_unified_offline_rl" in metadatas and self.embodiment_tag.value == "gr1_unified":
-            self.embodiment_tag = EmbodimentTag.GR1_UNIFIED_OFFLINE_RL
-        metadata = DatasetMetadata.model_validate(metadatas[self.embodiment_tag.value])
+        if self.embodiment_tag.value in train_cfg.modality_configs:
+            instantiated_modality_configs = instantiate(
+                train_cfg.modality_configs[self.embodiment_tag.value]
+            )
+        else:
+            instantiated_modality_configs = instantiate(train_cfg.modality_configs)
+
+        metadata = None
+        if metadata_dataset_path is not None:
+            fps = None
+            if "fps" in train_cfg and self.embodiment_tag.value in train_cfg.fps:
+                fps = train_cfg.fps[self.embodiment_tag.value]
+            metadata_dataset = LeRobotSingleDataset(
+                dataset_path=metadata_dataset_path,
+                modality_configs=instantiated_modality_configs,
+                embodiment_tag=self.embodiment_tag,
+                use_global_metadata=False,
+                transforms=None,
+                fps=fps,
+                max_chunk_size=train_cfg.get("max_chunk_size", None),
+                relative_action=train_cfg.get("relative_action", False),
+                relative_action_keys=train_cfg.get("relative_action_keys", None),
+                relative_action_per_horizon=train_cfg.get("relative_action_per_horizon", False),
+            )
+            metadata = metadata_dataset.metadata
+            print(f"Loaded metadata for {self.embodiment_tag.value} from dataset {metadata_dataset_path}")
+        else:
+            metadata_path = exp_cfg_dir / "metadata.json"
+            with open(metadata_path, "r") as f:
+                metadatas = json.load(f)
+            if "gr1_unified_offline_rl" in metadatas and self.embodiment_tag.value == "gr1_unified":
+                self.embodiment_tag = EmbodimentTag.GR1_UNIFIED_OFFLINE_RL
+            metadata = DatasetMetadata.model_validate(metadatas[self.embodiment_tag.value])
 
         # 2.2. Get the eval transforms
         assert (
@@ -378,20 +454,25 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         
         # Set per-horizon statistics for PerHorizonActionTransform if using relative_action_per_horizon
         relative_action_per_horizon = self.train_cfg.get('relative_action_per_horizon', False)
-        print(f"DEBUG: relative_action_per_horizon = {relative_action_per_horizon}")
+        debug_infer = os.environ.get("DREAMZERO_DEBUG_INFER", "0") == "1"
+        if debug_infer:
+            print(f"DEBUG: relative_action_per_horizon = {relative_action_per_horizon}")
         if relative_action_per_horizon:
             # Extract per-horizon statistics from metadata
             # The metadata has format: {embodiment: {statistics: {action: {key: {stat: [[h0], [h1], ...]}}}}
             action_stats = metadata.statistics.action
-            print(f"DEBUG: action_stats keys = {list(action_stats.keys())}")
+            if debug_infer:
+                print(f"DEBUG: action_stats keys = {list(action_stats.keys())}")
             per_horizon_stats = {}
             for action_key in action_stats:
                 stats_dict = action_stats[action_key].model_dump()
-                print(f"DEBUG: action_key={action_key}, stats_dict keys={list(stats_dict.keys())}")
+                if debug_infer:
+                    print(f"DEBUG: action_key={action_key}, stats_dict keys={list(stats_dict.keys())}")
                 # Check if stats are per-horizon (2D lists) by examining q01/q99
                 if 'q01' in stats_dict:
                     q01_val = stats_dict['q01']
-                    print(f"DEBUG: q01 type={type(q01_val)}, value sample={q01_val[:2] if hasattr(q01_val, '__getitem__') else q01_val}")
+                    if debug_infer:
+                        print(f"DEBUG: q01 type={type(q01_val)}, value sample={q01_val[:2] if hasattr(q01_val, '__getitem__') else q01_val}")
                     # Handle both list and numpy array
                     is_2d = False
                     if isinstance(q01_val, (list, np.ndarray)) and len(q01_val) > 0:
@@ -419,12 +500,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         self.eval_transform = eval_transform
 
         # 3. Load horizons needed
-        if self.embodiment_tag.value in train_cfg.modality_configs:
-            self.modality_configs = instantiate(
-                train_cfg.modality_configs[self.embodiment_tag.value]
-            )
-        else:
-            self.modality_configs = instantiate(train_cfg.modality_configs)
+        self.modality_configs = instantiated_modality_configs
 
         self._video_delta_indices = np.array(self.modality_configs.video.eval_delta_indices)
         # self._video_delta_indices = np.array([0])
@@ -497,6 +573,44 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         batch.normalized_obs = normalized_input
         return batch
 
+    def _ensure_inference_action_fields(self, normalized_input):
+        """Fill training-only action fields required by the action head at inference."""
+        if (
+            "action" in normalized_input
+            and "action_mask" in normalized_input
+            and "has_real_action" in normalized_input
+        ):
+            return normalized_input
+
+        batch_size = None
+        device = None
+        float_dtype = torch.float32
+        for value in normalized_input.values():
+            if torch.is_tensor(value):
+                batch_size = value.shape[0]
+                device = value.device
+                if value.dtype.is_floating_point:
+                    float_dtype = value.dtype
+                break
+
+        if batch_size is None:
+            raise ValueError("Unable to infer batch size for inference defaults.")
+
+        action_dim = getattr(self.trained_model.config, "action_dim", 1)
+        normalized_input.setdefault(
+            "action",
+            torch.zeros((batch_size, 0, action_dim), dtype=float_dtype, device=device),
+        )
+        normalized_input.setdefault(
+            "action_mask",
+            torch.zeros((batch_size, 0, action_dim), dtype=torch.bool, device=device),
+        )
+        normalized_input.setdefault(
+            "has_real_action",
+            torch.zeros((batch_size,), dtype=torch.bool, device=device),
+        )
+        return normalized_input
+
     def unapply(self, batch: Batch, obs: dict = None, **kwargs):
         """Unnormalize actions and convert relative actions to absolute if needed"""
         unnormalized_action = self.eval_transform.unapply(
@@ -507,7 +621,8 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         relative_action = self.train_cfg.get('relative_action', False)
         relative_action_per_horizon = self.train_cfg.get('relative_action_per_horizon', False)
         relative_action_keys = self.train_cfg.get('relative_action_keys', [])
-        print("relative_action_per_horizon", relative_action_per_horizon)
+        if os.environ.get("DREAMZERO_DEBUG_INFER", "0") == "1":
+            print("relative_action_per_horizon", relative_action_per_horizon)
         if (relative_action or relative_action_per_horizon) and relative_action_keys and obs is not None:
             for key in relative_action_keys:
                 action_key = f"action.{key}"
@@ -581,6 +696,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         for k, v in normalized_input.items():
             if torch.is_tensor(v) and v.dtype == torch.float32 and self.eval_bf16:
                 normalized_input[k] = v.to(dtype=torch.bfloat16)
+        normalized_input = self._ensure_inference_action_fields(normalized_input)
 
         # 3. Model inference
         with torch.inference_mode():
@@ -621,6 +737,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         for k, v in normalized_input.items():
             if torch.is_tensor(v) and v.dtype == torch.float32 and self.eval_bf16:
                 normalized_input[k] = v.to(dtype=torch.bfloat16)
+        normalized_input = self._ensure_inference_action_fields(normalized_input)
 
         # 3. Model inference
         with torch.inference_mode():
@@ -671,6 +788,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         for k, v in normalized_input.items():
             if torch.is_tensor(v) and v.dtype == torch.float32 and self.eval_bf16:
                 normalized_input[k] = v.to(dtype=torch.bfloat16)
+        normalized_input = self._ensure_inference_action_fields(normalized_input)
 
         model_start_time = time.perf_counter()
 
@@ -698,7 +816,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         untransform_time = time.perf_counter() - untransform_start_time
         total_time = transform_time + model_time + untransform_time
 
-        if self.rank == 0:
+        if self.rank == 0 and os.environ.get("DREAMZERO_DEBUG_INFER", "0") == "1":
             print(f"Inference Time: Total {total_time:.3f} seconds, "
                   f"Transform: {transform_time:.3f} seconds, "
                   f"Model: {model_time:.3f} seconds, "
