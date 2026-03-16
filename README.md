@@ -1,256 +1,259 @@
-# DreamZero: World Action Models Are Zero-Shot Policies
-[[Project Page](https://dreamzero0.github.io/)] [[Paper](https://arxiv.org/abs/2602.15922)]
+# DreamZero on LIBERO
 
-DreamZero is a World Action Model that jointly predicts actions and videos, achieving strong zero-shot performance on unseen tasks. This release package contains everything needed to load a pretrained DreamZero model and run distributed inference via a WebSocket server.
+This repository contains my reproduction and adaptation of **DreamZero** on the **LIBERO** benchmark.
 
-## News
+The current goal of this codebase is to connect the DreamZero training and inference pipeline to LIBERO data and the official LIBERO benchmark, including:
 
-- **02/27:** DreamZero is **#1 on both [MolmoSpaces]([https://huggingface.co/spaces/ai2-adapt/MolmoSpaces](https://molmospaces.allen.ai/leaderboard)) and [RoboArena]([https://robo-arena.github.io/](https://robo-arena.github.io/leaderboard))**! DreamZero-DROID is trained *from scratch* using only the DROID dataset — no pretraining on large-scale robot data, unlike competing VLAs. This demonstrates the strength of video-model backbones for generalist robot policies (VAMs/WAMs).
-- **02/27:** Released **DreamZero-AgiBot checkpoint** and **post-training code** for efficient few-shot adaptation. Post-train on just ~30 minutes of play data for your specific robot, and see the robot do basic language following and pick-and-place (see YAM experiments in our paper for more detail).
-- **02/20:** Released the **full training codebase, preprocessed dataset, and guide for new embodiments** to replicate the DreamZero-DROID checkpoint and train on your own robot. See [Adding a New Embodiment to DreamZero](docs/DATASET_TO_GEAR_AND_TRAIN.md) for a step-by-step walkthrough.
+- converting raw LIBERO `hdf5` demonstrations into the format required by DreamZero
+- training DreamZero on `libero_spatial`
+- evaluating DreamZero with the official LIBERO closed-loop rollout pipeline
+- continuing training from an existing DreamZero checkpoint with LoRA / continued training on LIBERO
 
-## Features
+This repository is intended for:
 
-**Available Now**
-- Pretrained DreamZero-DROID model checkpoint [[Huggingface](https://huggingface.co/GEAR-Dreams/DreamZero-DROID)]
-- Pretrained DreamZero-AgiBot checkpoint (for post-training on new embodiments) [[Huggingface](https://huggingface.co/GEAR-Dreams/DreamZero-AgiBot)]
-- Distributed WebSocket inference server (GB200, H100)
-- DiT caching for optimized inference (~0.6s on GB200, ~3s on H100)
-- DROID simulation evaluation support
-- [RoboArena](https://robo-arena.github.io/) integration (DROID real)
-- Video generation and saving (MP4)
-- LoRA and full fine-tuning training scripts
-- Training on new embodiments (AgiBot, YAM) — see [guide](docs/DATASET_TO_GEAR_AND_TRAIN.md)
+- reproducing DreamZero training on LIBERO
+- studying DreamZero's joint video-action modeling behavior in simulation tasks
+- serving as a starting point for extending to other LIBERO suites or other embodied benchmarks
 
-**Coming Soon**
-- [PolaRiS](https://polaris-evals.github.io/) simulation environment support
-- [Genie 3.0](https://arxiv.org/abs/2601.02078) sim environment support for DreamZero-AgiBot
+## Current Status
 
-## Testing Out DreamZero in Simulation with API
-We provide an inference script that directly evaluates a hosted DreamZero-DROID policy on [`sim_evals`](https://github.com/arhanjain/sim-evals). To test out the policy, first request access to the API via this form [link](https://forms.gle/zCj5zjDvHsoeuMXU7). Then, follow these instructions to install [`sim_evals`](https://github.com/arhanjain/sim-evals) and launch evaluation.
+The main working pipeline is:
+
+```text
+LIBERO raw hdf5
+  -> dreamzero/scripts/data/convert_libero.py
+  -> LeRobot-style dataset + GEAR metadata
+  -> dreamzero/scripts/train/libero_spatial_training.sh
+  -> DreamZero training
+  -> dreamzero/eval_utils/run_libero_server.py
+  -> dreamzero/eval_utils/run_libero_eval.py
+  -> official LIBERO closed-loop rollout
+```
+
+The default setup currently corresponds to:
+
+- benchmark: `libero_spatial`
+- observation:
+  - `agentview_rgb`
+  - `eye_in_hand_rgb`
+  - `joint_position`
+  - `gripper_position`
+  - `language_instruction`
+- raw `state_dim = 9`
+- raw `action_dim = 7`
+- action space: `osc_pose` / ee-space delta
+- control frequency: `20 Hz`
+- training window:
+  - `num_frames = 25`
+  - `action_horizon = 24`
+
+## Repository Layout
+
+```text
+.
+|-- dreamzero/
+|   |-- scripts/data/convert_libero.py
+|   |-- scripts/train/libero_spatial_training.sh
+|   |-- eval_utils/run_libero_server.py
+|   |-- eval_utils/run_libero_eval.py
+|   |-- groot/vla/...
+|-- LIBERO/
+|   |-- official LIBERO codebase
+|-- Dreamzero2libero.md
+|-- Dreamzero2libero_experience.md
+|-- Dreamzero2libero_training_reference.md
+```
+
+Notes:
+
+- `dreamzero/` contains the main training, inference, and evaluation bridge code.
+- `LIBERO/` is the local official LIBERO codebase used together with this repo.
+- The `Dreamzero2libero*.md` files in the repository root are engineering notes from the integration and reproduction process.
+
+## Environment Setup
+
+This workflow usually involves at least two kinds of environments:
+
+- a DreamZero training / policy server environment
+- a LIBERO evaluation environment with `libero` installed correctly
+
+If you only want to train and export checkpoints, the `dreamzero/` environment is the main one.
+If you want to run official LIBERO rollouts, it is recommended to prepare a separate environment that can import `libero` cleanly.
+
+For the base installation, refer to:
+
+- [dreamzero/README.md](./dreamzero/README.md)
+- [dreamzero/docs/DATASET_TO_GEAR_AND_TRAIN.md](./dreamzero/docs/DATASET_TO_GEAR_AND_TRAIN.md)
+
+## Data Preparation
+
+### 1. Prepare the raw LIBERO dataset
+
+You first need the official LIBERO demonstrations. The current workflow expects raw `*_demo.hdf5` files.
+
+### 2. Convert the dataset into the DreamZero training format
+
+Run the following under `dreamzero/`:
 
 ```bash
-# Clone repository
-git clone --recurse-submodules https://github.com/arhanjain/sim-evals.git
-cd sim-evals
+cd dreamzero
 
-# Install uv
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Activate uv environment
-uv sync
-source .venv/bin/activate
-
-# [Optional] update pytorch versions
-pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu129
-
-# Download assets (may need to export HF_TOKEN=<YOUR_HUGGINGFACE_TOKEN> first)
-uvx hf download owhan/DROID-sim-environments --repo-type dataset --local-dir assets
-
-# Run eval script
-cd ..
-python eval_utils/run_sim_eval.py --host <API_HOST> --port <API_PORT> 
+python scripts/data/convert_libero.py \
+  --suite-path <path-to-libero-suite> \
+  --output-path ./data/libero_spatial_lerobot
 ```
 
-The outputs are saved in `runs` directory.
-
-
-## Quick Start
-
-### Prerequisites
-
-- **Python**: 3.11
-- **Hardware**: Multi-GPU setup (tested on GB200, H100)
-  - Minimum: 2 GPUs for distributed inference
-- **CUDA**: Compatible GPU with CUDA 12.9+
-
-### Installation
-
-1. **Create conda environment:**
-```bash
-conda create -n dreamzero python=3.11
-conda activate dreamzero
-```
-
-2. **Install dependencies (PyTorch 2.8+ with CUDA 12.9+):**
-```bash
-pip install -e . --extra-index-url https://download.pytorch.org/whl/cu129
-```
-
-3. **Install flash attention:**
-```bash
-MAX_JOBS=8 pip install --no-build-isolation flash-attn
-```
-
-4. **[GB200 ONLY, SKIP FOR H100] Install Transformer Engine:**
-```bash
-pip install --no-build-isolation transformer_engine[pytorch]
-```
-
-## Downloading Pretrained Checkpoints
-
-### DreamZero-DROID (for inference)
-
-We release a 14B pretrained DROID checkpoint on [Huggingface](https://huggingface.co/GEAR-Dreams/DreamZero-DROID). To download the checkpoint, run
+For the current main setup, this is typically:
 
 ```bash
-hf download GEAR-Dreams/DreamZero-DROID --repo-type model --local-dir <path/to/checkpoint>
+python scripts/data/convert_libero.py \
+  --suite-path <LIBERO-dataset-root>/libero_spatial \
+  --output-path ./data/libero_spatial_lerobot
 ```
 
-### DreamZero-AgiBot (for fine-tuning on new embodiments)
+This step does two things:
 
-To fine-tune DreamZero on a new embodiment (e.g. YAM, AgiBot), download the pretrained [DreamZero-AgiBot](https://huggingface.co/GEAR-Dreams/DreamZero-AgiBot) checkpoint (~45GB) to `./checkpoints/DreamZero-AgiBot`:
+- converts raw LIBERO `hdf5` files into a LeRobot-style dataset
+- generates the metadata required by DreamZero/GEAR training, such as `meta/modality.json` and `meta/stats.json`
 
-```bash
-git clone https://huggingface.co/GEAR-Dreams/DreamZero-AgiBot ./checkpoints/DreamZero-AgiBot
+The converted dataset should look like:
+
+```text
+dreamzero/data/libero_spatial_lerobot/
+|-- data/
+|-- videos/
+|-- meta/
+|   |-- info.json
+|   |-- modality.json
+|   |-- episodes.jsonl
+|   |-- tasks.jsonl
+|   |-- stats.json
 ```
-
-Or with the Hugging Face CLI:
-
-```bash
-hf download GEAR-Dreams/DreamZero-AgiBot --repo-type model --local-dir ./checkpoints/DreamZero-AgiBot
-```
-
-The YAM and AgiBot training scripts use `pretrained_model_path=./checkpoints/DreamZero-AgiBot` by default. See the [new embodiment guide](docs/DATASET_TO_GEAR_AND_TRAIN.md) for usage.
-
-## Running the Inference Server
-
-### Command Overview
-
-The inference server uses PyTorch distributed training utilities to parallelize the model across multiple GPUs:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 socket_test_optimized_AR.py --port 5000 --enable-dit-cache --model-path <path/to/checkpoint>
-```
-
-To verify the server is working, run a test client. The first few inferences will take a few minutes to warm up. After warming up, inference takes ~0.6s on GB200 and ~3s on H100.
-
-```
-python test_client_AR.py --port 5000
-```
-
-### Command-line Arguments
-
-- `--port`: Port number for the WebSocket server (default: 8000)
-- `--model-path`: Path to the pretrained model checkpoint directory
-- `--enable-dit-cache`: Enable caching in DiT layers for faster inference (recommended)
-- `--max-chunk-size`: Override max_chunk_size for inference (optional)
-- `--timeout-seconds`: Server timeout in seconds (default: 50000)
-- `--index`: Index for output directory naming (default: 0)
-
-
-### Output
-
-The server saves:
-- **Videos**: Generated video predictions as MP4 files in `{model_path}/real_world_eval_gen_{date}_{index}/{checkpoint_name}/`
-- **Input observations**: Saved per message in `{output_dir}/inputs/{msg_index}_{timestamp}/`
-
 
 ## Training
 
-> **Training on a new embodiment?** See [Adding a New Embodiment to DreamZero](docs/DATASET_TO_GEAR_AND_TRAIN.md) for a complete guide on converting your dataset, configuring modalities, and launching training. <em>Make sure to align the 3 camera view order to ensure positive transfer.</em>
+The current training entry script is:
 
-### Downloading Pretrained Base Model Weights
+- [dreamzero/scripts/train/libero_spatial_training.sh](./dreamzero/scripts/train/libero_spatial_training.sh)
 
-DreamZero is built on top of [Wan2.1-I2V-14B-480P](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P) and uses the [umt5-xxl](https://huggingface.co/google/umt5-xxl) tokenizer. Download both before training:
-
-```bash
-pip install "huggingface_hub[cli]"
-
-# You may need to set your HuggingFace token:
-# export HF_TOKEN=<YOUR_HUGGINGFACE_TOKEN>
-
-# Download Wan2.1 model weights (~28GB)
-hf download Wan-AI/Wan2.1-I2V-14B-480P --local-dir ./checkpoints/Wan2.1-I2V-14B-480P
-
-# Download umt5-xxl tokenizer
-hf download google/umt5-xxl --local-dir ./checkpoints/umt5-xxl
-```
-
-> **Note:** The training script will auto-download these if they are not found at the configured paths, but pre-downloading is recommended to avoid delays at launch.
-
-### DROID Dataset
-
-We release the preprocessed DROID dataset used to train DreamZero on HuggingFace: [GEAR-Dreams/DreamZero-DROID-Data](https://huggingface.co/datasets/GEAR-Dreams/DreamZero-DROID-Data).
-
-This dataset is derived from the [DROID 1.0.1](https://droid-dataset.github.io/) dataset with the following modifications:
-- Converted from RLDS/TFDS format to [LeRobot](https://github.com/huggingface/lerobot) v2.0 format
-- Idle frames removed using [Physical Intelligence's idle frame detector](https://github.com/Physical-Intelligence/openpi/blob/main/examples/droid/README_train.md#data-filtering) (`droid_sample_ranges_v1_0_1.json`)
-- Episodes without language annotations are filtered out
-- Successful episodes only (episodes with non-zero reward)
-- 3 camera views: `exterior_image_1_left`, `exterior_image_2_left`, `wrist_image_left`
-
-**To download the preprocessed dataset (~131GB):**
+Run:
 
 ```bash
-huggingface-cli download GEAR-Dreams/DreamZero-DROID-Data --repo-type dataset --local-dir ./data/droid_lerobot
+cd dreamzero
+
+export LIBERO_DATA_ROOT=./data/libero_spatial_lerobot
+export OUTPUT_DIR=./checkpoints/dreamzero_libero_spatial
+export NUM_GPUS=8
+
+bash scripts/train/libero_spatial_training.sh
 ```
 
-If you want to reproduce the dataset conversion from raw DROID 1.0.1 yourself (or modify the filtering), see [docs/DROID_CONVERSION.md](docs/DROID_CONVERSION.md).
+By default, the script will automatically check for or download:
 
-### Running Training
+- `Wan2.1-I2V-14B-480P`
+- `umt5-xxl`
+
+Key training defaults currently include:
+
+- `num_frames=25`
+- `action_horizon=24`
+- `num_views=2`
+- `learning_rate=1e-5`
+- `warmup_ratio=0.05`
+- `weight_decay=1e-5`
+- `bf16=true`
+- `train_architecture=lora`
+
+If you want to continue training from an existing DreamZero checkpoint, you can additionally set:
 
 ```bash
-# Configure paths (override defaults as needed)
-export DROID_DATA_ROOT="./data/droid_lerobot"
-export OUTPUT_DIR="./checkpoints/dreamzero_droid"
-export NUM_GPUS=4
-
-# Point to your downloaded model weights (if not using default paths)
-export WAN_CKPT_DIR="./checkpoints/Wan2.1-I2V-14B-480P"
-export TOKENIZER_DIR="./checkpoints/umt5-xxl"
-
-# Launch training
-bash scripts/train/droid_training.sh
+export PRETRAINED_MODEL_PATH=<path-to-checkpoint>
+export RESET_LIBERO_HEADS=true
 ```
 
-### Training Configuration
+## Evaluation
 
-The training script uses Hydra for configuration and DeepSpeed ZeRO Stage 2 for distributed training. Key defaults:
+The current evaluation setup uses a DreamZero websocket policy server connected to the official LIBERO environment.
 
-| Parameter | Default | Description |
-|---|---|---|
-| `NUM_GPUS` | 4 | Number of GPUs |
-| `per_device_train_batch_size` | 1 | Batch size per GPU |
-| `learning_rate` | 1e-5 | Learning rate |
-| `max_steps` | 10 | Max training steps (increase for full training) |
-| `warmup_ratio` | 0.05 | Warmup ratio |
-| `weight_decay` | 1e-5 | Weight decay |
-| `image_resolution_width` | 320 | Image width |
-| `image_resolution_height` | 176 | Image height |
-| `num_frames` | 33 | Number of video frames |
-| `action_horizon` | 24 | Action prediction horizon |
-| `save_lora_only` | true | Only save LoRA weights |
-| `bf16` | true | Use bfloat16 precision |
+### 1. Start the DreamZero policy server
 
-> **Note:** `max_steps=10` is set for a quick sanity check. For full training, increase this to your desired number of steps and configure `save_steps` / `save_strategy` accordingly.
+Under `dreamzero/`:
 
+```bash
+cd dreamzero
 
-## Citation
-
-If you use DreamZero in your research, please cite:
-
-```bibtex
-@misc{ye2026worldactionmodelszeroshot,
-      title={World Action Models are Zero-shot Policies}, 
-      author={Seonghyeon Ye and Yunhao Ge and Kaiyuan Zheng and Shenyuan Gao and Sihyun Yu and George Kurian and Suneel Indupuru and You Liang Tan and Chuning Zhu and Jiannan Xiang and Ayaan Malik and Kyungmin Lee and William Liang and Nadun Ranawaka and Jiasheng Gu and Yinzhen Xu and Guanzhi Wang and Fengyuan Hu and Avnish Narayan and Johan Bjorck and Jing Wang and Gwanghyun Kim and Dantong Niu and Ruijie Zheng and Yuqi Xie and Jimmy Wu and Qi Wang and Ryan Julian and Danfei Xu and Yilun Du and Yevgen Chebotar and Scott Reed and Jan Kautz and Yuke Zhu and Linxi "Jim" Fan and Joel Jang},
-      year={2026},
-      eprint={2602.15922},
-      archivePrefix={arXiv},
-      primaryClass={cs.RO},
-      url={https://arxiv.org/abs/2602.15922}, 
-}
+python eval_utils/run_libero_server.py \
+  --model-path <path-to-checkpoint> \
+  --metadata-dataset-path ./data/libero_spatial_lerobot \
+  --port 8000
 ```
 
-## License
+### 2. Run official LIBERO rollout evaluation
 
-This project is licensed under the [Apache License 2.0](LICENSE).
+Then, in a working LIBERO environment:
 
-## Support
+```bash
+cd dreamzero
 
-For issues and questions:
-- Check the troubleshooting section above
-- Review server logs for detailed error messages
-- Verify your checkpoint is compatible with this release
+python eval_utils/run_libero_eval.py \
+  --libero-root ../LIBERO \
+  --host localhost \
+  --port 8000 \
+  --benchmark-name libero_spatial \
+  --checkpoint-path <path-to-checkpoint> \
+  --output-dir ./runs/libero_eval
+```
 
-[![Star History Chart](https://api.star-history.com/svg?repos=dreamzero0/dreamzero&type=Date)](https://star-history.com/#dreamzero0/dreamzero&Date)
+Evaluation results are saved as:
+
+- `results.json`
+- `results.csv`
+- optional rollout videos
+
+### Evaluation Protocol
+
+The current evaluation pipeline is:
+
+- closed-loop rollout at the episode level
+- but action chunks are executed in a segmented open-loop manner
+
+In practice, the model predicts an action chunk at once, and the client executes several actions before requesting the next inference call. This is the actual DreamZero-on-LIBERO evaluation behavior in this repository.
+
+## Important Files
+
+If you want to read the code efficiently, these are the best entry points:
+
+- [dreamzero/scripts/data/convert_libero.py](./dreamzero/scripts/data/convert_libero.py)
+- [dreamzero/scripts/train/libero_spatial_training.sh](./dreamzero/scripts/train/libero_spatial_training.sh)
+- [dreamzero/groot/vla/configs/data/dreamzero/libero_spatial.yaml](./dreamzero/groot/vla/configs/data/dreamzero/libero_spatial.yaml)
+- [dreamzero/groot/vla/model/dreamzero/transform/dreamzero_cotrain.py](./dreamzero/groot/vla/model/dreamzero/transform/dreamzero_cotrain.py)
+- [dreamzero/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py](./dreamzero/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py)
+- [dreamzero/groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py](./dreamzero/groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py)
+- [dreamzero/eval_utils/run_libero_server.py](./dreamzero/eval_utils/run_libero_server.py)
+- [dreamzero/eval_utils/run_libero_eval.py](./dreamzero/eval_utils/run_libero_eval.py)
+
+## Additional Notes
+
+For more detailed engineering notes and design references, see:
+
+- [Dreamzero2libero.md](./Dreamzero2libero.md)
+- [Dreamzero2libero_experience.md](./Dreamzero2libero_experience.md)
+- [Dreamzero2libero_training_reference.md](./Dreamzero2libero_training_reference.md)
+- [Dreamzero2libero_continued_training_plan.md](./Dreamzero2libero_continued_training_plan.md)
+
+## Known Notes
+
+- The current main workflow is focused on `libero_spatial`.
+- The data, training, and evaluation scripts are aligned with the current local implementation, but a small smoke test is still recommended before large-scale runs.
+- If you upload this repository publicly, it is a good idea to clearly state in the release notes that:
+  - this is a reproduction / adaptation project built on top of DreamZero and LIBERO
+  - checkpoint usage, dataset usage, and upstream licenses must follow the original projects
+
+## Acknowledgements
+
+This repository is built on top of:
+
+- [DreamZero](https://github.com/dreamzero0/dreamzero)
+- [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO)
+
+If this repository is useful for your work, please also cite the corresponding upstream projects and papers.
