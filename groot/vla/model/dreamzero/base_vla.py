@@ -1,3 +1,4 @@
+import copy
 from dataclasses import dataclass, field
 from typing import Tuple
 
@@ -337,7 +338,8 @@ class VLA(PreTrainedModel):
     @classmethod
     def load_lora(
         cls, 
-        pretrained_model_name_or_path: str
+        pretrained_model_name_or_path: str,
+        config: VLAConfig | None = None,
     ): 
         from safetensors.torch import load_file
         import os
@@ -370,10 +372,14 @@ class VLA(PreTrainedModel):
         
         # Load config
         print("loading config@@")
-        config_path = os.path.join(pretrained_model_name_or_path, "config.json")
-        with open(config_path, "r") as f:
-            config_dict = json.load(f)
-        config = VLAConfig(**config_dict)
+        if config is None:
+            config_path = os.path.join(pretrained_model_name_or_path, "config.json")
+            with open(config_path, "r") as f:
+                config_dict = json.load(f)
+            config = VLAConfig(**config_dict)
+        else:
+            # Avoid mutating the caller's config object when we flip load-time flags below.
+            config = copy.deepcopy(config)
         print("loading model")
 
         # Disable defer_lora_injection so LoRA layers are created during init,

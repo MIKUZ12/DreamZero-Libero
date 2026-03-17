@@ -58,12 +58,28 @@ class LiberoDreamZeroPolicy:
                 f"reason=client_reset"
             )
 
+    def _as_video(self, value) -> np.ndarray:
+        video = np.asarray(value, dtype=np.uint8)
+        if video.ndim == 3:
+            return video[None, ...]
+        if video.ndim == 4:
+            return video
+        raise ValueError(f"Expected video input with 3 or 4 dims, got shape {video.shape}")
+
+    def _as_state(self, value) -> np.ndarray:
+        state = np.asarray(value, dtype=np.float64)
+        if state.ndim == 1:
+            return state[None, ...]
+        if state.ndim == 2:
+            return state
+        raise ValueError(f"Expected state input with 1 or 2 dims, got shape {state.shape}")
+
     def _convert_observation(self, obs: dict) -> dict:
         return {
-            "video.agentview_rgb": np.asarray(obs["observation/exterior_image_0_left"], dtype=np.uint8)[None, ...],
-            "video.eye_in_hand_rgb": np.asarray(obs["observation/wrist_image_left"], dtype=np.uint8)[None, ...],
-            "state.joint_position": np.asarray(obs["observation/joint_position"], dtype=np.float64)[None, ...],
-            "state.gripper_position": np.asarray(obs["observation/gripper_position"], dtype=np.float64)[None, ...],
+            "video.agentview_rgb": self._as_video(obs["observation/exterior_image_0_left"]),
+            "video.eye_in_hand_rgb": self._as_video(obs["observation/wrist_image_left"]),
+            "state.joint_position": self._as_state(obs["observation/joint_position"]),
+            "state.gripper_position": self._as_state(obs["observation/gripper_position"]),
             "annotation.language.language_instruction": obs.get("prompt", ""),
         }
 
@@ -253,7 +269,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Bind host.")
     parser.add_argument("--port", type=int, default=8000, help="Bind port.")
     parser.add_argument("--device", type=str, default="cuda:0", help="Inference device.")
-    parser.add_argument("--max-chunk-size", type=int, default=None, help="Optional inference override.")
+    parser.add_argument("--max-chunk-size", type=int, default=None, help="Optional diffusion local-attention chunk override.")
+    parser.add_argument(
+        "--num-frame-per-block",
+        type=int,
+        default=None,
+        help="Optional inference override for temporal block size. This changes memory/latency trade-offs.",
+    )
     parser.add_argument(
         "--metadata-dataset-path",
         type=str,
@@ -325,13 +347,26 @@ def main() -> None:
     )
     logging.info("Initialized rank %d/%d on device %s", rank, world_size, device)
 
+    model_config_overrides: list[str] = []
+    if args.max_chunk_size is not None:
+        # max_chunk_size lives under diffusion_model_cfg in checkpoint config.
+        model_config_overrides.append(
+            f"action_head_cfg.config.diffusion_model_cfg.max_chunk_size={args.max_chunk_size}"
+        )
+    if args.num_frame_per_block is not None:
+        # Keep action_head and diffusion_model_cfg in sync.
+        model_config_overrides.append(
+            f"action_head_cfg.config.num_frame_per_block={args.num_frame_per_block}"
+        )
+        model_config_overrides.append(
+            f"action_head_cfg.config.diffusion_model_cfg.num_frame_per_block={args.num_frame_per_block}"
+        )
+
     policy = GrootSimPolicy(
         embodiment_tag=EmbodimentTag.LIBERO_SIM,
         model_path=args.model_path,
         device=device,
-        model_config_overrides=(
-            [f"max_chunk_size={args.max_chunk_size}"] if args.max_chunk_size is not None else []
-        ),
+        model_config_overrides=model_config_overrides,
         device_mesh=device_mesh,
         metadata_dataset_path=args.metadata_dataset_path,
     )

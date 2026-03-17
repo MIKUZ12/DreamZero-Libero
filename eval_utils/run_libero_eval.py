@@ -53,15 +53,55 @@ class PickleWebsocketClient:
 
 
 class DreamZeroLiberoClient:
-    def __init__(self, host: str, port: int, open_loop_horizon: int = 8, debug_open_loop: bool = False) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        open_loop_horizon: int = 8,
+        history_frames: int = 25,
+        debug_open_loop: bool = False,
+    ) -> None:
+        if history_frames <= 0:
+            raise ValueError(f"history_frames must be positive, got {history_frames}")
         self.client = PickleWebsocketClient(host=host, port=port)
         self.open_loop_horizon = open_loop_horizon
+        self.history_frames = history_frames
         self.debug_open_loop = debug_open_loop
         self.actions_from_chunk_completed = 0
         self.pred_action_chunk: np.ndarray | None = None
         self.session_id = str(uuid.uuid4())
         self.request_index = 0
         self.env_step_index = 0
+        self._is_first_request = True
+        self._frame_buffers = {
+            "agentview": [],
+            "wrist": [],
+        }
+
+    def _reset_history(self) -> None:
+        for frames in self._frame_buffers.values():
+            frames.clear()
+
+    def _append_history(self, obs: dict) -> None:
+        frame_sources = {
+            "agentview": np.asarray(obs["agentview_image"], dtype=np.uint8),
+            "wrist": np.asarray(obs["robot0_eye_in_hand_image"], dtype=np.uint8),
+        }
+        for key, frame in frame_sources.items():
+            frames = self._frame_buffers[key]
+            frames.append(frame)
+            if len(frames) > self.history_frames:
+                del frames[:-self.history_frames]
+
+    def _stack_recent_frames(self, key: str, num_frames: int) -> np.ndarray:
+        frames = self._frame_buffers[key]
+        if not frames:
+            raise RuntimeError(f"No buffered frames available for {key}")
+        if num_frames <= 0:
+            raise ValueError(f"num_frames must be positive, got {num_frames}")
+
+        padded_frames = [frames[0]] * max(0, num_frames - len(frames)) + frames
+        return np.stack(padded_frames[-num_frames:], axis=0)
 
     def reset(self) -> None:
         if self.debug_open_loop:
@@ -75,8 +115,11 @@ class DreamZeroLiberoClient:
         self.session_id = str(uuid.uuid4())
         self.request_index = 0
         self.env_step_index = 0
+        self._is_first_request = True
+        self._reset_history()
 
     def infer(self, obs: dict, instruction: str) -> np.ndarray:
+        self._append_history(obs)
         needs_new_chunk = (
             self.actions_from_chunk_completed == 0
             or self.pred_action_chunk is None
@@ -85,9 +128,12 @@ class DreamZeroLiberoClient:
         if needs_new_chunk:
             self.actions_from_chunk_completed = 0
             self.request_index += 1
+            request_frames = 1 if self._is_first_request else self.history_frames
+            agentview_video = self._stack_recent_frames("agentview", request_frames)
+            wrist_video = self._stack_recent_frames("wrist", request_frames)
             request_data = {
-                "observation/exterior_image_0_left": np.asarray(obs["agentview_image"], dtype=np.uint8),
-                "observation/wrist_image_left": np.asarray(obs["robot0_eye_in_hand_image"], dtype=np.uint8),
+                "observation/exterior_image_0_left": agentview_video,
+                "observation/wrist_image_left": wrist_video,
                 "observation/joint_position": np.asarray(obs["robot0_joint_pos"], dtype=np.float64),
                 "observation/gripper_position": np.asarray(obs["robot0_gripper_qpos"], dtype=np.float64),
                 "prompt": instruction,
@@ -99,9 +145,11 @@ class DreamZeroLiberoClient:
             if self.debug_open_loop:
                 tqdm.write(
                     f"[client][request] session={self.session_id} request={self.request_index} "
-                    f"env_step={self.env_step_index} open_loop_horizon={self.open_loop_horizon}"
+                    f"env_step={self.env_step_index} open_loop_horizon={self.open_loop_horizon} "
+                    f"request_frames={request_frames} history_shape={agentview_video.shape}"
                 )
             result = self.client.infer(request_data)
+            self._is_first_request = False
             actions = result["actions"] if isinstance(result, dict) else result
             actions = np.asarray(actions, dtype=np.float32)
             if actions.ndim != 2 or actions.shape[-1] != 7:
@@ -194,6 +242,12 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="How many predicted actions to execute per server call. Default matches DreamZero sim-eval.",
     )
+    parser.add_argument(
+        "--history-frames",
+        type=int,
+        default=25,
+        help="How many recent frames to send per policy request. Default matches LIBERO train-time frame count.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("./runs/libero_eval"), help="Directory for JSON/CSV results.")
     parser.add_argument("--checkpoint-path", type=Path, default=None, help="Optional checkpoint path recorded in results.json.")
     parser.add_argument("--save-video", action="store_true", help="Save rollout videos for the first few episodes of each task.")
@@ -225,11 +279,13 @@ def main() -> None:
         args.host,
         args.port,
         open_loop_horizon=args.open_loop_horizon,
+        history_frames=args.history_frames,
         debug_open_loop=args.debug_open_loop,
     )
     tqdm.write(
         f"[eval][start] benchmark={args.benchmark_name} task_ids={task_ids} "
-        f"n_eval={args.n_eval} max_steps={args.max_steps} open_loop_horizon={args.open_loop_horizon}"
+        f"n_eval={args.n_eval} max_steps={args.max_steps} open_loop_horizon={args.open_loop_horizon} "
+        f"history_frames={args.history_frames}"
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -239,6 +295,7 @@ def main() -> None:
         "n_eval": args.n_eval,
         "max_steps": args.max_steps,
         "open_loop_horizon": args.open_loop_horizon,
+        "history_frames": args.history_frames,
         "checkpoint_path": str(args.checkpoint_path.resolve()) if args.checkpoint_path is not None else None,
         "server_metadata": client.client.metadata,
         "tasks": [],
