@@ -131,7 +131,7 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                         processed_item = (
                             "A multi-view video shows that a robot "
                             + processed_item.lower()
-                            + " The video is split into two views: The first view shows a static scene camera, and the second view shows the camera view from the robot's wrist. The robot "
+                            + " The video is split into two views placed side by side: The left view shows a static scene camera, and the right view shows the camera view from the robot's wrist. The robot "
                             + processed_item.lower()
                         )
                     else:
@@ -168,7 +168,7 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                         item = (
                             "A multi-view video shows that a robot "
                             + str(item).lower()
-                            + " The video is split into two views: The first view shows a static scene camera, and the second view shows the camera view from the robot's wrist. The robot "
+                            + " The video is split into two views placed side by side: The left view shows a static scene camera, and the right view shows the camera view from the robot's wrist. The robot "
                             + str(item).lower()
                         )
                     else:
@@ -379,6 +379,20 @@ class DreamTransform(InvertibleModalityTransform):
 
                 return concat_images
             
+            if self.embodiment_tag == EmbodimentTag.LIBERO_SIM and v >= 2:
+                # LIBERO raw renders arrive vertically inverted in both the
+                # converted training set and the online simulator. Correct them
+                # here so train/eval policy inputs share the same upright view.
+                static_scene = np.flip(images[0], axis=-2).copy()  # (t, c, h, w)
+                wrist_image = np.flip(images[1], axis=-2).copy()   # (t, c, h, w)
+
+                # Keep LIBERO's two-view layout explicit and compact: static scene on the left,
+                # wrist camera on the right, with no padded black quadrant.
+                concat_images = np.zeros((1, t, c, h, 2 * w), dtype=images.dtype)
+                concat_images[0, :, :, :, :w] = static_scene
+                concat_images[0, :, :, :, w:] = wrist_image
+                return concat_images
+
             # For other embodiments: use 2x2 grid layout
             # Layout: [head, right]
             #         [left, black]

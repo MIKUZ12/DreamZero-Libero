@@ -36,11 +36,18 @@ VIDEO_KEYS = ("agentview_rgb", "eye_in_hand_rgb")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
         "--suite-path",
         type=Path,
-        required=True,
+        default=None,
         help="Path to a LIBERO suite directory containing *_demo.hdf5 files.",
+    )
+    input_group.add_argument(
+        "--hdf5-path",
+        type=Path,
+        default=None,
+        help="Path to a single LIBERO *_demo.hdf5 file to convert.",
     )
     parser.add_argument(
         "--output-path",
@@ -87,9 +94,31 @@ def parse_args() -> argparse.Namespace:
 
 def encode_video(frames: np.ndarray, output_path: Path, fps: int) -> None:
     if av is None:
-        with imageio.get_writer(output_path, fps=fps, codec="h264") as writer:
-            for frame in frames:
-                writer.append_data(frame)
+        height = int(frames.shape[1])
+        width = int(frames.shape[2])
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            str(fps),
+            "-i",
+            "-",
+            "-an",
+            "-vcodec",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(output_path),
+        ]
+        subprocess.run(ffmpeg_cmd, input=np.ascontiguousarray(frames).tobytes(), check=True, capture_output=True)
         return
 
     options = {
@@ -339,23 +368,37 @@ def run_gear_conversion(output_path: Path) -> None:
 
 def main() -> None:
     args = parse_args()
-    suite_path = args.suite_path.resolve()
     output_path = args.output_path.resolve()
-    suite_name = args.suite_name or suite_path.name
+    hdf5_paths: list[Path]
 
-    if not suite_path.exists():
-        raise FileNotFoundError(f"Suite path does not exist: {suite_path}")
+    if args.hdf5_path is not None:
+        hdf5_path = args.hdf5_path.resolve()
+        if not hdf5_path.exists():
+            raise FileNotFoundError(f"HDF5 path does not exist: {hdf5_path}")
+        hdf5_paths = [hdf5_path]
+        inferred_suite_name = hdf5_path.stem
+        if inferred_suite_name.endswith("_demo"):
+            inferred_suite_name = inferred_suite_name[: -len("_demo")]
+    else:
+        suite_path = args.suite_path.resolve()
+        if not suite_path.exists():
+            raise FileNotFoundError(f"Suite path does not exist: {suite_path}")
+        hdf5_paths = sorted(suite_path.glob("*_demo.hdf5"))
+        inferred_suite_name = suite_path.name
+
+    suite_name = args.suite_name or inferred_suite_name
 
     if output_path.exists():
         if not args.force:
             raise FileExistsError(f"Output path already exists: {output_path}")
         shutil.rmtree(output_path)
 
-    hdf5_paths = sorted(suite_path.glob("*_demo.hdf5"))
     if args.limit_files is not None:
         hdf5_paths = hdf5_paths[: args.limit_files]
     if not hdf5_paths:
-        raise FileNotFoundError(f"No *_demo.hdf5 files found under {suite_path}")
+        if args.suite_path is not None:
+            raise FileNotFoundError(f"No *_demo.hdf5 files found under {args.suite_path.resolve()}")
+        raise FileNotFoundError("No input HDF5 files found to convert.")
 
     task_to_index: OrderedDict[str, int] = OrderedDict()
     episodes: list[dict] = []

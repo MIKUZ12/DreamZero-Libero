@@ -2,8 +2,8 @@
 
 export HYDRA_FULL_ERROR=1
 
-LIBERO_DATA_ROOT=${LIBERO_DATA_ROOT:-"./data/libero_spatial_lerobot"}
-OUTPUT_DIR=${OUTPUT_DIR:-"./checkpoints/dreamzero_libero_spatial_lora_5k"}
+LIBERO_DATA_ROOT=${LIBERO_DATA_ROOT:-"./data/libero_goal_single_task_lerobot"}
+OUTPUT_DIR=${OUTPUT_DIR:-"./checkpoints/dreamzero_libero_goal"}
 if [ -z "${NUM_GPUS}" ]; then
   NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 fi
@@ -16,6 +16,7 @@ MAX_STEPS=${MAX_STEPS:-5000}
 SAVE_STEPS=${SAVE_STEPS:-500}
 REPORT_TO=${REPORT_TO:-none}
 RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
+FRAME_SEQLEN=${FRAME_SEQLEN:-512}
 
 if [ ! -d "$WAN_CKPT_DIR" ] || [ -z "$(ls -A "$WAN_CKPT_DIR" 2>/dev/null)" ]; then
     echo "Wan2.1-I2V-14B-480P not found at $WAN_CKPT_DIR. Downloading from HuggingFace..."
@@ -52,7 +53,7 @@ TORCHRUN_ARGS=(
     model=dreamzero/vla \
     model/dreamzero/action_head=wan_flow_matching_action_tf \
     model/dreamzero/transform=dreamzero_cotrain \
-    num_frame_per_block=2 \
+    num_frame_per_block=6 \
     num_action_per_block=24 \
     num_state_per_block=1 \
     seed=42 \
@@ -76,7 +77,7 @@ TORCHRUN_ARGS=(
     image_resolution_height_single_frame=256 \
     save_lora_only=true \
     max_chunk_size=4 \
-    frame_seqlen=1024 \
+    "frame_seqlen=$FRAME_SEQLEN" \
     save_strategy=steps \
     "libero_data_root=$LIBERO_DATA_ROOT" \
     "dit_version=$WAN_CKPT_DIR" \

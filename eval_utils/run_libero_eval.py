@@ -189,8 +189,10 @@ def load_init_states(init_states_path: Path):
 
 
 def make_rollout_frame(obs: dict) -> np.ndarray:
-    agentview = np.asarray(obs["agentview_image"], dtype=np.uint8)
-    wrist = np.asarray(obs["robot0_eye_in_hand_image"], dtype=np.uint8)
+    # LIBERO render frames are vertically inverted in our current setup.
+    # Keep policy inputs unchanged and only correct orientation for saved videos.
+    agentview = np.flipud(np.asarray(obs["agentview_image"], dtype=np.uint8)).copy()
+    wrist = np.flipud(np.asarray(obs["robot0_eye_in_hand_image"], dtype=np.uint8)).copy()
     if wrist.shape[0] != agentview.shape[0]:
         # Simple nearest-neighbor resize without extra deps.
         row_idx = np.linspace(0, wrist.shape[0] - 1, agentview.shape[0]).astype(np.int64)

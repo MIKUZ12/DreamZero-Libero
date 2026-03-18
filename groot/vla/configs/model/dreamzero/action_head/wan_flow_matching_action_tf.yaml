@@ -34,6 +34,11 @@ action_head_cfg:
     init_lora_weights: "kaiming"
     train_architecture: ${train_architecture}
     use_gradient_checkpointing: true
+    # Skip loading all Wan components (text/image/VAE/DiT) and keep random init.
+    # Useful for true scratch training.
+    skip_all_component_loading: false
+    # Keep text/image/VAE frozen by default. Set false for true full-parameter training.
+    freeze_text_image_vae: true
     add_pos_embed: ${add_pos_embed}
     model_dtype: float32
     max_state_dim: ${max_state_dim}
@@ -57,19 +62,19 @@ action_head_cfg:
       dropout: ${attn_dropout}
       final_dropout: true
     diffusion_model_cfg:
+      dim: 5120
       _target_: groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk.CausalWanModel
+      ffn_dim: 13824
       _convert_: object
       diffusion_model_pretrained_path: ${dit_version}
       model_type: "i2v"
+      num_heads: 40
+      num_layers: 40
       frame_seqlen: ${frame_seqlen}
-      dim: 5120
       in_dim: 36
-      ffn_dim: 13824
       out_dim: 16
       freq_dim: 256
       eps: 1e-6
-      num_heads: 40
-      num_layers: 40
       max_chunk_size: ${max_chunk_size}
       num_frame_per_block: ${num_frame_per_block}
       num_action_per_block: ${num_action_per_block}
