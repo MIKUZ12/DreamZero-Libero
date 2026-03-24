@@ -179,6 +179,16 @@ def to_task_index(task_to_index: OrderedDict[str, int], task: str) -> int:
     return task_to_index[task]
 
 
+def encode_gripper_action_openvla(raw_gripper_action: np.ndarray) -> np.ndarray:
+    """Match OpenVLA LIBERO action encoding: 0 = close, 1 = open.
+
+    Raw LIBERO demos store the gripper command in the last action dimension with
+    approximately -1 = open and +1 = close. OpenVLA clips this value into [0, 1]
+    and inverts it so the training target becomes 1 = open, 0 = close.
+    """
+    return 1.0 - np.clip(raw_gripper_action, 0.0, 1.0)
+
+
 def write_episode(
     demo_group: h5py.Group,
     task_index: int,
@@ -187,7 +197,7 @@ def write_episode(
     fps: int,
 ) -> dict:
     actions = np.asarray(demo_group["actions"], dtype=np.float64)
-    joint_states = np.asarray(demo_group["obs"]["joint_states"], dtype=np.float64)
+    ee_states = np.asarray(demo_group["obs"]["ee_states"], dtype=np.float64)
     gripper_states = np.asarray(demo_group["obs"]["gripper_states"], dtype=np.float64)
     rewards = np.asarray(demo_group["rewards"], dtype=np.float64)
     dones = np.asarray(demo_group["dones"], dtype=bool)
@@ -204,9 +214,9 @@ def write_episode(
             parents=True, exist_ok=True
         )
 
-    state = np.concatenate([joint_states, gripper_states], axis=-1)
+    state = np.concatenate([ee_states, gripper_states], axis=-1)
     pose_delta = actions[:, :6]
-    gripper_action = actions[:, 6:7]
+    gripper_action = encode_gripper_action_openvla(actions[:, 6:7])
     packed_action = np.concatenate([pose_delta, gripper_action], axis=-1)
 
     episode_df = pd.DataFrame(
@@ -322,8 +332,8 @@ def write_metadata(
             },
             STATE_KEY: {
                 "dtype": "float64",
-                "shape": [9],
-                "names": ["joint_position", "gripper_position"],
+                "shape": [8],
+                "names": ["eef_state", "gripper_state"],
             },
             ACTION_KEY: {
                 "dtype": "float64",
@@ -357,7 +367,7 @@ def run_gear_conversion(output_path: Path) -> None:
         "--embodiment-tag",
         "libero_sim",
         "--state-keys",
-        '{"joint_position": [0, 7], "gripper_position": [7, 9]}',
+        '{"eef_state": [0, 6], "gripper_state": [6, 8]}',
         "--action-keys",
         '{"pose_delta": [0, 6], "gripper_position": [6, 7]}',
         "--task-key",

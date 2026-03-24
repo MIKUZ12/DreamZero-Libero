@@ -21,6 +21,21 @@ from tqdm.auto import tqdm
 DEFAULT_LIBERO_ROOT = Path(__file__).resolve().parents[2] / "LIBERO"
 
 
+def quat_to_axis_angle(quat: np.ndarray) -> np.ndarray:
+    try:
+        import robosuite.utils.transform_utils as T
+    except ModuleNotFoundError as exc:  # pragma: no cover - depends on eval env
+        raise ModuleNotFoundError(
+            "run_libero_eval.py requires robosuite in the LIBERO evaluation environment "
+            "to convert robot0_eef_quat into observation/ee_state."
+        ) from exc
+
+    quat = np.asarray(quat, dtype=np.float64)
+    if quat.ndim == 1:
+        return T.quat2axisangle(quat)
+    return np.stack([T.quat2axisangle(q) for q in quat], axis=0)
+
+
 class PickleWebsocketClient:
     def __init__(self, host: str = "localhost", port: int = 8000) -> None:
         self._uri = f"ws://{host}:{port}"
@@ -60,6 +75,7 @@ class DreamZeroLiberoClient:
         open_loop_horizon: int = 8,
         history_frames: int = 25,
         debug_open_loop: bool = False,
+        return_video_pred: bool = False,
     ) -> None:
         if history_frames <= 0:
             raise ValueError(f"history_frames must be positive, got {history_frames}")
@@ -67,8 +83,10 @@ class DreamZeroLiberoClient:
         self.open_loop_horizon = open_loop_horizon
         self.history_frames = history_frames
         self.debug_open_loop = debug_open_loop
+        self.return_video_pred = return_video_pred
         self.actions_from_chunk_completed = 0
         self.pred_action_chunk: np.ndarray | None = None
+        self.pred_video_chunks: list[np.ndarray] = []
         self.session_id = str(uuid.uuid4())
         self.request_index = 0
         self.env_step_index = 0
@@ -112,6 +130,7 @@ class DreamZeroLiberoClient:
         self.client.reset({"session_id": self.session_id})
         self.actions_from_chunk_completed = 0
         self.pred_action_chunk = None
+        self.pred_video_chunks = []
         self.session_id = str(uuid.uuid4())
         self.request_index = 0
         self.env_step_index = 0
@@ -128,19 +147,31 @@ class DreamZeroLiberoClient:
         if needs_new_chunk:
             self.actions_from_chunk_completed = 0
             self.request_index += 1
-            request_frames = 1 if self._is_first_request else self.history_frames
+            # Use the full history length for every request, including the first.
+            # _stack_recent_frames() already left-pads with the earliest frame when
+            # the buffer is still short, which keeps inference aligned with the
+            # train-time 25-frame context and avoids VAE failures on 1-frame inputs.
+            request_frames = self.history_frames
             agentview_video = self._stack_recent_frames("agentview", request_frames)
             wrist_video = self._stack_recent_frames("wrist", request_frames)
+            eef_state = np.concatenate(
+                [
+                    np.asarray(obs["robot0_eef_pos"], dtype=np.float64),
+                    quat_to_axis_angle(obs["robot0_eef_quat"]),
+                ],
+                axis=-1,
+            )
             request_data = {
                 "observation/exterior_image_0_left": agentview_video,
                 "observation/wrist_image_left": wrist_video,
-                "observation/joint_position": np.asarray(obs["robot0_joint_pos"], dtype=np.float64),
+                "observation/ee_state": eef_state,
                 "observation/gripper_position": np.asarray(obs["robot0_gripper_qpos"], dtype=np.float64),
                 "prompt": instruction,
                 "session_id": self.session_id,
                 "client_request_index": self.request_index,
                 "client_env_step_index": self.env_step_index,
                 "client_open_loop_horizon": self.open_loop_horizon,
+                "return_video_pred": self.return_video_pred,
             }
             if self.debug_open_loop:
                 tqdm.write(
@@ -155,6 +186,11 @@ class DreamZeroLiberoClient:
             if actions.ndim != 2 or actions.shape[-1] != 7:
                 raise ValueError(f"Expected action chunk of shape (N, 7), got {actions.shape}")
             self.pred_action_chunk = actions
+            if isinstance(result, dict) and "video_pred" in result:
+                video_pred = np.asarray(result["video_pred"], dtype=np.uint8)
+                if video_pred.ndim != 4:
+                    raise ValueError(f"Expected video_pred clip with shape [T, H, W, C], got {video_pred.shape}")
+                self.pred_video_chunks.append(video_pred)
             if self.debug_open_loop:
                 tqdm.write(
                     f"[client][response] session={self.session_id} request={self.request_index} "
@@ -207,6 +243,11 @@ def write_rollout_video(frames: list[np.ndarray], output_path: Path, fps: int = 
     imageio.mimsave(output_path, frames, fps=fps, codec="libx264")
 
 
+def write_video_clip(frames: np.ndarray, output_path: Path, fps: int = 20) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.mimsave(output_path, list(frames), fps=fps, codec="libx264")
+
+
 def write_results(output_dir: Path, results: dict) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     with open(output_dir / "results.json", "w", encoding="utf-8") as file:
@@ -254,6 +295,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-path", type=Path, default=None, help="Optional checkpoint path recorded in results.json.")
     parser.add_argument("--save-video", action="store_true", help="Save rollout videos for the first few episodes of each task.")
     parser.add_argument(
+        "--save-video-pred",
+        action="store_true",
+        help="Save DreamZero internal decoded video_pred clips for policy requests in the first few episodes of each task.",
+    )
+    parser.add_argument(
         "--debug-open-loop",
         action="store_true",
         help="Print detailed client-side request/reuse logs. Disabled by default to keep tqdm readable.",
@@ -261,7 +307,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--video-episodes-per-task",
         type=int,
-        default=2,
+        default=1,
         help="How many episodes per task to save when --save-video is enabled.",
     )
     return parser.parse_args()
@@ -283,6 +329,7 @@ def main() -> None:
         open_loop_horizon=args.open_loop_horizon,
         history_frames=args.history_frames,
         debug_open_loop=args.debug_open_loop,
+        return_video_pred=args.save_video_pred,
     )
     tqdm.write(
         f"[eval][start] benchmark={args.benchmark_name} task_ids={task_ids} "
@@ -348,6 +395,7 @@ def main() -> None:
             steps = 0
             video_frames = []
             save_video = args.save_video and episode_idx < args.video_episodes_per_task
+            save_video_pred = args.save_video_pred and episode_idx < args.video_episodes_per_task
             if save_video:
                 video_frames.append(make_rollout_frame(obs))
             rollout_progress = tqdm(
@@ -371,6 +419,7 @@ def main() -> None:
 
             successes += int(success)
             video_path = None
+            pred_video_paths = []
             if save_video and video_frames:
                 video_path = (
                     args.output_dir
@@ -379,12 +428,24 @@ def main() -> None:
                     / f"episode_{episode_idx:03d}.mp4"
                 )
                 write_rollout_video(video_frames, video_path)
+            if save_video_pred and client.pred_video_chunks:
+                pred_dir = (
+                    args.output_dir
+                    / "video_pred"
+                    / f"task_{task_id:02d}_{task.name}"
+                    / f"episode_{episode_idx:03d}"
+                )
+                for chunk_idx, chunk in enumerate(client.pred_video_chunks):
+                    pred_path = pred_dir / f"request_{chunk_idx:03d}.mp4"
+                    write_video_clip(chunk, pred_path)
+                    pred_video_paths.append(str(pred_path))
             task_result["episodes"].append(
                 {
                     "episode_index": episode_idx,
                     "success": success,
                     "steps": steps,
                     "video_path": str(video_path) if video_path is not None else None,
+                    "video_pred_paths": pred_video_paths,
                 }
             )
             task_result["success_rate"] = successes / float(episode_idx + 1)

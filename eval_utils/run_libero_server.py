@@ -24,6 +24,11 @@ from tianshou.data import Batch
 from groot.vla.data.schema import EmbodimentTag
 from groot.vla.model.n1_5.sim_policy import GrootSimPolicy
 
+try:
+    import robosuite.utils.transform_utils as T
+except ModuleNotFoundError:  # pragma: no cover - depends on local env
+    T = None
+
 
 @dataclasses.dataclass
 class ServerMetadata:
@@ -74,12 +79,38 @@ class LiberoDreamZeroPolicy:
             return state
         raise ValueError(f"Expected state input with 1 or 2 dims, got shape {state.shape}")
 
+    def _quat_to_axis_angle(self, quat) -> np.ndarray:
+        quat = np.asarray(quat, dtype=np.float64)
+        if quat.ndim == 1:
+            quat = quat[None, ...]
+        if quat.shape[-1] != 4:
+            raise ValueError(f"Expected quaternion with last dim 4, got shape {quat.shape}")
+        if T is not None:
+            return np.stack([T.quat2axisangle(q) for q in quat], axis=0)
+
+        xyz = quat[..., :3]
+        w = quat[..., 3:4]
+        xyz_norm = np.linalg.norm(xyz, axis=-1, keepdims=True)
+        safe_xyz_norm = np.where(xyz_norm < 1e-12, 1.0, xyz_norm)
+        angle = 2.0 * np.arctan2(xyz_norm, w)
+        axis = xyz / safe_xyz_norm
+        axis_angle = axis * angle
+        axis_angle = np.where(xyz_norm < 1e-12, 0.0, axis_angle)
+        return axis_angle
+
     def _convert_observation(self, obs: dict) -> dict:
+        if "observation/ee_state" in obs:
+            eef_state = self._as_state(obs["observation/ee_state"])
+        else:
+            eef_pos = self._as_state(obs["observation/eef_pos"])
+            eef_quat = self._as_state(obs["observation/eef_quat"])
+            eef_axis_angle = self._quat_to_axis_angle(eef_quat)
+            eef_state = np.concatenate([eef_pos, eef_axis_angle], axis=-1)
         return {
             "video.agentview_rgb": self._as_video(obs["observation/exterior_image_0_left"]),
             "video.eye_in_hand_rgb": self._as_video(obs["observation/wrist_image_left"]),
-            "state.joint_position": self._as_state(obs["observation/joint_position"]),
-            "state.gripper_position": self._as_state(obs["observation/gripper_position"]),
+            "state.eef_state": eef_state,
+            "state.gripper_state": self._as_state(obs["observation/gripper_position"]),
             "annotation.language.language_instruction": obs.get("prompt", ""),
         }
 
@@ -88,6 +119,12 @@ class LiberoDreamZeroPolicy:
         with torch.no_grad():
             result_batch, _ = self._policy.lazy_joint_forward_causal(Batch(obs=converted))
             return result_batch
+
+    def _forward_with_video(self, obs: dict):
+        converted = self._convert_observation(obs)
+        with torch.no_grad():
+            result_batch, video_pred = self._policy.lazy_joint_forward_causal(Batch(obs=converted))
+            return result_batch, video_pred
 
     def _format_actions(self, action_dict) -> dict:
         pose_delta = action_dict["action.pose_delta"]
@@ -108,9 +145,26 @@ class LiberoDreamZeroPolicy:
         elif gripper.ndim == 0:
             gripper = gripper.reshape(1, 1)
 
-        gripper = np.where(gripper >= 0, 1.0, -1.0).astype(np.float32)
+        # Match OpenVLA LIBERO action decoding:
+        # training target uses 0 = close, 1 = open, while the simulator expects
+        # +1 = close and -1 = open.
+        gripper = 2.0 * gripper - 1.0
+        gripper = np.sign(gripper)
+        gripper = -gripper.astype(np.float32)
         actions = np.concatenate([pose_delta, gripper], axis=-1)
         return {"actions": actions}
+
+    def _decode_video_pred(self, video_pred: torch.Tensor) -> np.ndarray:
+        action_head = self._policy.trained_model.action_head
+        vae = action_head.vae
+        with torch.no_grad():
+            decoded = vae.decode(video_pred.to(device=action_head._device, dtype=torch.bfloat16))
+        decoded = decoded.detach().float().cpu()
+        if decoded.ndim != 5:
+            raise ValueError(f"Expected decoded video to have 5 dims [B, C, T, H, W], got {decoded.shape}")
+        decoded = decoded[0].permute(1, 2, 3, 0).numpy()
+        decoded = ((decoded + 1.0) / 2.0 * 255.0).clip(0, 255).astype(np.uint8)
+        return decoded
 
     def infer(self, obs: dict) -> dict:
         action_head = self._policy.trained_model.action_head
@@ -121,8 +175,15 @@ class LiberoDreamZeroPolicy:
                 f"env_step={obs.get('client_env_step_index', 'unknown')} "
                 f"open_loop_horizon={obs.get('client_open_loop_horizon', 'unknown')}"
             )
-        result_batch = self._forward(obs)
+        request_video_pred = bool(obs.get("return_video_pred", False))
+        if request_video_pred:
+            result_batch, video_pred = self._forward_with_video(obs)
+        else:
+            result_batch = self._forward(obs)
+            video_pred = None
         formatted = self._format_actions(result_batch.act)
+        if request_video_pred and video_pred is not None:
+            formatted["video_pred"] = self._decode_video_pred(video_pred)
         if self._debug_open_loop and getattr(action_head, "ip_rank", 0) == 0:
             print(
                 f"[server][response] session={obs.get('session_id', 'unknown')} "

@@ -1274,6 +1274,33 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         return traj_data
 
 
+class ShardedLeRobotSubLangSingleActionChunkDatasetLIBERO(
+    ShardedLeRobotSubLangSingleActionChunkDatasetDROID
+):
+    """
+    LIBERO chunked dataset that reuses DROID's multi-chunk alignment sampler.
+
+    Sampling behavior matches the DROID-style chunking scheme:
+    - video expands to 8n + 1 raw frames
+    - state expands to n anchors
+    - action expands to 24n steps
+
+    The modality semantics still come from LIBERO metadata, so the dataset keeps:
+    - state.eef_state + state.gripper_state
+    - action.pose_delta + action.gripper_position
+    """
+
+    def __init__(self, *args, **kwargs):
+        relative_action = kwargs.get("relative_action", False)
+        relative_action_per_horizon = kwargs.get("relative_action_per_horizon", False)
+        if relative_action or relative_action_per_horizon:
+            raise ValueError(
+                "ShardedLeRobotSubLangSingleActionChunkDatasetLIBERO requires "
+                "relative_action=false and relative_action_per_horizon=false because "
+                "LIBERO actions are already pose deltas."
+            )
+        super().__init__(*args, **kwargs)
+
 
 class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
     """

@@ -634,7 +634,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
                 # Try to find the state data - check multiple possible key formats
                 last_state = None
                 
-                # Format 1: Direct key like "state.joint_position"
+                # Format 1: Direct key like "state.eef_state"
                 if state_key in obs:
                     last_state = obs[state_key]
                 else:
@@ -644,7 +644,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
                             last_state = obs[obs_key]
                             break
                     
-                    # Format 3: If key is "joint_position" and obs has "state" key directly
+                    # Format 3: If obs already contains a concatenated "state" tensor directly
                     # This handles cases where the observation uses modality-level keys
                     if last_state is None and 'state' in obs:
                         state_data = obs['state']

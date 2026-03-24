@@ -2,12 +2,12 @@
 
 export HYDRA_FULL_ERROR=1
 
-LIBERO_DATA_ROOT=${LIBERO_DATA_ROOT:-"./data/libero_goal_single_task_lerobot"}
-OUTPUT_DIR=${OUTPUT_DIR:-"./checkpoints/dreamzero_libero_goal"}
+LIBERO_DATA_ROOT=${LIBERO_DATA_ROOT:-"./data/libero_spatial_single_task_lerobot"}
+OUTPUT_DIR=${OUTPUT_DIR:-"./checkpoints/dreamzero_libero_spatial_single"}
 if [ -z "${NUM_GPUS}" ]; then
   NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 fi
-NUM_GPUS=${NUM_GPUS:-8}
+NUM_GPUS=${NUM_GPUS:-4}
 WAN_CKPT_DIR=${WAN_CKPT_DIR:-"./checkpoints/Wan2.1-I2V-14B-480P"}
 TOKENIZER_DIR=${TOKENIZER_DIR:-"./checkpoints/umt5-xxl"}
 PRETRAINED_MODEL_PATH=${PRETRAINED_MODEL_PATH:-}
