@@ -74,12 +74,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--alignment",
         type=str,
-        choices=("eval_history", "train_chunk"),
+        choices=("eval_history", "train_chunk", "teacher_forced_open_loop"),
         default="train_chunk",
         help=(
             "Offline alignment mode. "
             "'eval_history' uses past-frame history like deployment; "
-            "'train_chunk' uses the converted dataset's training-time future chunk semantics."
+            "'train_chunk' uses the converted dataset's training-time future chunk semantics; "
+            "'teacher_forced_open_loop' replays an episode with ground-truth observations but "
+            "keeps the policy's causal cache between chunk requests like deployment."
+        ),
+    )
+    parser.add_argument(
+        "--open-loop-horizon",
+        type=int,
+        default=1,
+        help=(
+            "How many predicted actions to consume from each chunk before re-querying the model. "
+            "Used by teacher_forced_open_loop mode."
         ),
     )
     parser.add_argument("--device", type=str, default="cuda:0", help="Inference device.")
@@ -118,6 +129,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-height", type=int, default=128, help="Render camera height.")
     parser.add_argument("--camera-width", type=int, default=128, help="Render camera width.")
     parser.add_argument("--fps", type=int, default=20, help="Output video fps.")
+    parser.add_argument(
+        "--save-video-pred",
+        action="store_true",
+        help=(
+            "Save decoded model video_pred clips for offline diagnostics. "
+            "With teacher_forced_open_loop and open_loop_horizon=1, this gives one clip per step."
+        ),
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -251,6 +270,11 @@ def build_payload(
     eef_state: np.ndarray,
     gripper_position: np.ndarray,
     prompt: str,
+    session_id: str | None = None,
+    client_request_index: int = 0,
+    client_env_step_index: int = 0,
+    client_open_loop_horizon: int = 1,
+    return_video_pred: bool = False,
 ) -> dict:
     return {
         "observation/exterior_image_0_left": np.asarray(agentview_video, dtype=np.uint8),
@@ -258,10 +282,11 @@ def build_payload(
         "observation/ee_state": np.asarray(eef_state, dtype=np.float64),
         "observation/gripper_position": np.asarray(gripper_position, dtype=np.float64),
         "prompt": prompt,
-        "session_id": str(uuid.uuid4()),
-        "client_request_index": 0,
-        "client_env_step_index": 0,
-        "client_open_loop_horizon": 1,
+        "session_id": str(uuid.uuid4()) if session_id is None else session_id,
+        "client_request_index": client_request_index,
+        "client_env_step_index": client_env_step_index,
+        "client_open_loop_horizon": client_open_loop_horizon,
+        "return_video_pred": return_video_pred,
     }
 
 
@@ -309,6 +334,32 @@ def summarize_offline_trace(trace: list[dict[str, float | int]]) -> dict[str, ob
         "mean_chunk_pose_mae": float(np.mean(chunk_pose_mae)),
         "mean_chunk_action_l2": float(np.mean(chunk_action_l2)),
         "chunk_gripper_sign_accuracy": float(np.mean(chunk_gripper_sign)),
+        "trace": trace,
+    }
+
+
+def summarize_teacher_forced_open_loop_trace(trace: list[dict[str, float | int | bool]]) -> dict[str, object]:
+    pose_l2 = [float(row["pose_l2"]) for row in trace]
+    pose_mae = [float(row["pose_mae"]) for row in trace]
+    action_l2 = [float(row["action_l2"]) for row in trace]
+    gripper_sign = [float(row["gripper_sign_match"]) for row in trace]
+    pred_abs_max = [float(row["pred_action_abs_max"]) for row in trace]
+    query_steps = [int(bool(row["query_step"])) for row in trace]
+    chunk_steps = [int(row["chunk_step_limit"]) for row in trace]
+    nan_rows = [bool(row["pred_action_has_nan"]) for row in trace]
+    inf_rows = [bool(row["pred_action_has_inf"]) for row in trace]
+    return {
+        "num_steps_evaluated": len(trace),
+        "num_model_queries": int(np.sum(query_steps)),
+        "mean_pose_l2": float(np.mean(pose_l2)),
+        "mean_pose_mae": float(np.mean(pose_mae)),
+        "mean_action_l2": float(np.mean(action_l2)),
+        "gripper_sign_accuracy": float(np.mean(gripper_sign)),
+        "mean_pred_action_abs_max": float(np.mean(pred_abs_max)),
+        "max_pred_action_abs_max": float(np.max(pred_abs_max)),
+        "mean_chunk_step_limit": float(np.mean(chunk_steps)),
+        "num_nan_actions": int(np.sum(nan_rows)),
+        "num_inf_actions": int(np.sum(inf_rows)),
         "trace": trace,
     }
 
@@ -435,6 +486,116 @@ def compute_offline_metrics_train_chunk(
         )
 
     return summarize_offline_trace(trace)
+
+
+def compute_teacher_forced_open_loop_metrics(
+    policy_wrapper,
+    demo_group: h5py.Group,
+    prompt: str,
+    history_frames: int,
+    open_loop_horizon: int,
+    max_steps: int | None,
+    save_video_pred: bool,
+    video_pred_dir: Path | None,
+    fps: int,
+) -> dict:
+    actions = np.asarray(demo_group["actions"][()], dtype=np.float32)
+    eef_states = np.asarray(demo_group["obs"]["ee_states"][()], dtype=np.float64)
+    gripper_states = np.asarray(demo_group["obs"]["gripper_states"][()], dtype=np.float64)
+    agentview = np.asarray(demo_group["obs"]["agentview_rgb"][()], dtype=np.uint8)
+    wrist = np.asarray(demo_group["obs"]["eye_in_hand_rgb"][()], dtype=np.uint8)
+
+    num_steps = len(actions) if max_steps is None else min(len(actions), max_steps)
+    trace: list[dict[str, float | int | bool]] = []
+    session_id = f"teacher-forced-open-loop-{uuid.uuid4()}"
+    policy_wrapper.reset({"session_id": session_id})
+
+    pred_raw_chunk: np.ndarray | None = None
+    pred_eval_chunk: np.ndarray | None = None
+    actions_from_chunk_completed = 0
+    request_index = 0
+
+    for step_index in range(num_steps):
+        needs_new_chunk = (
+            actions_from_chunk_completed == 0
+            or pred_eval_chunk is None
+            or actions_from_chunk_completed >= min(open_loop_horizon, len(pred_eval_chunk))
+        )
+        query_step = False
+
+        if needs_new_chunk:
+            actions_from_chunk_completed = 0
+            request_index += 1
+            # Re-query each chunk from the current ground-truth observation/history
+            # under a fresh policy cache. This keeps the diagnostic aligned with
+            # "teacher-forced open-loop over the dataset" instead of carrying the
+            # model's internal latent-video cache across chunk requests.
+            policy_wrapper.reset({"session_id": session_id, "request_index": request_index})
+            payload = build_payload(
+                agentview_video=left_pad_history(agentview, step_index, history_frames),
+                wrist_video=left_pad_history(wrist, step_index, history_frames),
+                eef_state=eef_states[step_index],
+                gripper_position=gripper_states[step_index],
+                prompt=prompt,
+                session_id=session_id,
+                client_request_index=request_index,
+                client_env_step_index=step_index,
+                client_open_loop_horizon=open_loop_horizon,
+                return_video_pred=save_video_pred,
+            )
+            if save_video_pred:
+                result_batch, video_pred = policy_wrapper._forward_with_video(payload)
+                pred_video_path = None
+                if video_pred_dir is not None:
+                    decoded_video_pred = policy_wrapper._decode_video_pred(video_pred)
+                    pred_video_path = video_pred_dir / f"request_{request_index:04d}_step_{step_index:04d}.mp4"
+                    write_video_clip(decoded_video_pred, pred_video_path, fps=fps)
+            else:
+                result_batch = policy_wrapper._forward(payload)
+                pred_video_path = None
+            pred_raw_chunk = format_action_dict(result_batch.act, threshold_gripper=False)
+            pred_eval_chunk = format_action_dict(result_batch.act, threshold_gripper=True)
+            query_step = True
+        else:
+            pred_video_path = None
+
+        assert pred_raw_chunk is not None and pred_eval_chunk is not None
+        chunk_step_limit = min(open_loop_horizon, len(pred_eval_chunk))
+        action_index_in_chunk = actions_from_chunk_completed
+        pred_raw = pred_raw_chunk[action_index_in_chunk]
+        pred_eval = pred_eval_chunk[action_index_in_chunk]
+        gt_action = actions[step_index]
+
+        trace.append(
+            {
+                "step": step_index,
+                "query_step": query_step,
+                "request_index": request_index,
+                "action_index_in_chunk": action_index_in_chunk,
+                "chunk_len": int(len(pred_eval_chunk)),
+                "chunk_step_limit": int(chunk_step_limit),
+                "gt_pose_x": float(gt_action[0]),
+                "gt_pose_y": float(gt_action[1]),
+                "gt_pose_z": float(gt_action[2]),
+                "pred_pose_x": float(pred_raw[0]),
+                "pred_pose_y": float(pred_raw[1]),
+                "pred_pose_z": float(pred_raw[2]),
+                "gt_gripper": float(gt_action[6]),
+                "pred_gripper_raw": float(pred_raw[6]),
+                "pred_gripper_eval": float(pred_eval[6]),
+                "pose_l2": float(np.linalg.norm(pred_eval[:6] - gt_action[:6])),
+                "pose_mae": float(np.mean(np.abs(pred_eval[:6] - gt_action[:6]))),
+                "action_l2": float(np.linalg.norm(pred_eval - gt_action)),
+                "gripper_sign_match": float(np.sign(pred_eval[6]) == np.sign(gt_action[6])),
+                "pred_action_abs_max": float(np.max(np.abs(pred_eval))),
+                "pred_action_has_nan": bool(np.isnan(pred_eval).any()),
+                "pred_action_has_inf": bool(np.isinf(pred_eval).any()),
+                "video_pred_path": str(pred_video_path.resolve()) if pred_video_path is not None else None,
+            }
+        )
+        actions_from_chunk_completed += 1
+
+    return summarize_teacher_forced_open_loop_trace(trace)
 
 
 def run_rollout_comparison(
@@ -570,6 +731,11 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
             file.write(json.dumps(row) + "\n")
 
 
+def write_video_clip(frames: np.ndarray, output_path: Path, fps: int = 20) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.mimsave(output_path, list(frames), fps=fps, codec="libx264")
+
+
 def init_runtime(device_arg: str, timeout_seconds: int) -> tuple[str, int, int, bool]:
     """Initialize distributed runtime for single-process or torchrun execution."""
     if dist is None or not dist.is_available():
@@ -586,9 +752,9 @@ def init_runtime(device_arg: str, timeout_seconds: int) -> tuple[str, int, int, 
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    initialized_here = True
 
     if world_size > 1:
+        initialized_here = True
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         dist.init_process_group(
             backend=backend,
@@ -602,10 +768,12 @@ def init_runtime(device_arg: str, timeout_seconds: int) -> tuple[str, int, int, 
             device = "cpu"
         return device, rank, world_size, initialized_here
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29531")
+    initialized_here = True
+    init_method = f"file:///tmp/dreamzero_diagnose_{uuid.uuid4().hex}"
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
     dist.init_process_group(
         backend="gloo",
+        init_method=init_method,
         rank=0,
         world_size=1,
         timeout=datetime.timedelta(seconds=timeout_seconds),
@@ -661,6 +829,18 @@ def main() -> None:
         metadata_dataset_path=str(args.metadata_dataset_path),
     )
     policy_wrapper = LiberoDreamZeroPolicy(policy)
+    if args.alignment == "teacher_forced_open_loop":
+        model_num_frames = None
+        try:
+            model_num_frames = int(policy.trained_model.config.action_head_cfg.num_frames)
+        except Exception:
+            model_num_frames = int(policy.train_cfg.get("num_frames", args.history_frames))
+        if args.history_frames != model_num_frames and rank == 0:
+            print(
+                f"[teacher_forced_open_loop] overriding history_frames from {args.history_frames} "
+                f"to checkpoint num_frames={model_num_frames} for causal inference compatibility"
+            )
+        args.history_frames = model_num_frames
     offline_dataset = None
     if args.alignment == "train_chunk":
         fps = None
@@ -689,11 +869,13 @@ def main() -> None:
         "task_name": default_task_name,
         "language": default_language,
         "history_frames": args.history_frames,
+        "open_loop_horizon": args.open_loop_horizon,
         "device": device,
         "rank": rank,
         "world_size": world_size,
         "offline_only": args.offline_only,
         "alignment": args.alignment,
+        "save_video_pred": args.save_video_pred,
         "offline_demos": [],
     }
 
@@ -722,6 +904,18 @@ def main() -> None:
                     demo_id=demo_id,
                     prompt=prompt,
                     max_steps=args.max_offline_steps,
+                )
+            elif args.alignment == "teacher_forced_open_loop":
+                metrics = compute_teacher_forced_open_loop_metrics(
+                    policy_wrapper=policy_wrapper,
+                    demo_group=demo_group,
+                    prompt=prompt,
+                    history_frames=args.history_frames,
+                    open_loop_horizon=args.open_loop_horizon,
+                    max_steps=args.max_offline_steps,
+                    save_video_pred=args.save_video_pred,
+                    video_pred_dir=(args.output_dir / "video_pred" / demo_name) if args.save_video_pred else None,
+                    fps=args.fps,
                 )
             else:
                 metrics = compute_offline_metrics_eval_history(

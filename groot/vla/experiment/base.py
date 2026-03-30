@@ -664,16 +664,31 @@ class BaseExperiment(ABC):
             )
 
         # Check if we are resuming training.
-        resume_path, continue_training = get_checkpoint_path(training_args.output_dir)
-        if not continue_training:
-            print(f"Models is ready under {training_args.output_dir}. Skip training.")
-            exit(0)
-        if resume_path:
-            print(f"Resuming training from {resume_path}")
-            resume_from_checkpoint = True
+        explicit_resume_path = cfg.get("resume_from_checkpoint", None)
+        if explicit_resume_path is not None:
+            explicit_resume_path = os.path.abspath(str(explicit_resume_path).rstrip("/"))
+            trainer_state_path = os.path.join(explicit_resume_path, TRAINER_STATE_NAME)
+            if not os.path.isdir(explicit_resume_path):
+                raise FileNotFoundError(
+                    f"Explicit resume checkpoint directory does not exist: {explicit_resume_path}"
+                )
+            if not os.path.exists(trainer_state_path):
+                raise FileNotFoundError(
+                    f"Explicit resume checkpoint is missing {TRAINER_STATE_NAME}: {explicit_resume_path}"
+                )
+            print(f"Resuming training from explicit checkpoint {explicit_resume_path}")
+            resume_from_checkpoint = explicit_resume_path
         else:
-            # First time training.
-            resume_from_checkpoint = False
+            resume_path, continue_training = get_checkpoint_path(training_args.output_dir)
+            if not continue_training:
+                print(f"Models is ready under {training_args.output_dir}. Skip training.")
+                exit(0)
+            if resume_path:
+                print(f"Resuming training from {resume_path}")
+                resume_from_checkpoint = True
+            else:
+                # First time training.
+                resume_from_checkpoint = False
 
         # Instantiate the model.
         model = self.create_model(cfg, training_args)

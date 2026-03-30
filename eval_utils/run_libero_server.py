@@ -43,11 +43,19 @@ RESET_SIGNAL = 2
 
 
 class LiberoDreamZeroPolicy:
+    FRAMES_PER_CHUNK = 4
+
     def __init__(self, policy: GrootSimPolicy) -> None:
         self._policy = policy
         self._debug_open_loop = os.environ.get("DREAMZERO_DEBUG_OPEN_LOOP", "0") == "1"
+        self._frame_buffers: dict[str, list[np.ndarray]] = {
+            "video.agentview_rgb": [],
+            "video.eye_in_hand_rgb": [],
+        }
+        self._is_first_call = True
+        self._current_session_id: str | None = None
 
-    def reset(self, payload: dict) -> None:
+    def _reset_action_head_state(self) -> None:
         action_head = self._policy.trained_model.action_head
         action_head.current_start_frame = 0
         action_head.language = None
@@ -57,6 +65,17 @@ class LiberoDreamZeroPolicy:
         action_head.kv_cache_neg = None
         action_head.crossattn_cache = None
         action_head.crossattn_cache_neg = None
+
+    def _reset_local_buffers(self) -> None:
+        for frames in self._frame_buffers.values():
+            frames.clear()
+        self._is_first_call = True
+
+    def reset(self, payload: dict) -> None:
+        self._reset_action_head_state()
+        self._reset_local_buffers()
+        self._current_session_id = None
+        action_head = self._policy.trained_model.action_head
         if self._debug_open_loop and getattr(action_head, "ip_rank", 0) == 0:
             print(
                 f"[server][reset] session={payload.get('session_id', 'unknown')} "
@@ -70,6 +89,24 @@ class LiberoDreamZeroPolicy:
         if video.ndim == 4:
             return video
         raise ValueError(f"Expected video input with 3 or 4 dims, got shape {video.shape}")
+
+    def _accumulate_video(self, key: str, value) -> np.ndarray:
+        video = np.asarray(value, dtype=np.uint8)
+        if video.ndim == 4:
+            return video
+        if video.ndim != 3:
+            raise ValueError(f"Expected video input with 3 or 4 dims, got shape {video.shape}")
+
+        buffer = self._frame_buffers[key]
+        buffer.append(video)
+        num_frames = 1 if self._is_first_call else self.FRAMES_PER_CHUNK
+        if len(buffer) >= num_frames:
+            frames_to_use = buffer[-num_frames:]
+        else:
+            frames_to_use = buffer.copy()
+            while len(frames_to_use) < num_frames:
+                frames_to_use.insert(0, buffer[0])
+        return np.stack(frames_to_use, axis=0)
 
     def _as_state(self, value) -> np.ndarray:
         state = np.asarray(value, dtype=np.float64)
@@ -98,6 +135,15 @@ class LiberoDreamZeroPolicy:
         axis_angle = np.where(xyz_norm < 1e-12, 0.0, axis_angle)
         return axis_angle
 
+    def _ensure_session(self, obs: dict) -> None:
+        session_id = obs.get("session_id")
+        if session_id is None or session_id == self._current_session_id:
+            return
+        if self._current_session_id is not None:
+            self._reset_action_head_state()
+            self._reset_local_buffers()
+        self._current_session_id = session_id
+
     def _convert_observation(self, obs: dict) -> dict:
         if "observation/ee_state" in obs:
             eef_state = self._as_state(obs["observation/ee_state"])
@@ -107,8 +153,12 @@ class LiberoDreamZeroPolicy:
             eef_axis_angle = self._quat_to_axis_angle(eef_quat)
             eef_state = np.concatenate([eef_pos, eef_axis_angle], axis=-1)
         return {
-            "video.agentview_rgb": self._as_video(obs["observation/exterior_image_0_left"]),
-            "video.eye_in_hand_rgb": self._as_video(obs["observation/wrist_image_left"]),
+            "video.agentview_rgb": self._accumulate_video(
+                "video.agentview_rgb", obs["observation/exterior_image_0_left"]
+            ),
+            "video.eye_in_hand_rgb": self._accumulate_video(
+                "video.eye_in_hand_rgb", obs["observation/wrist_image_left"]
+            ),
             "state.eef_state": eef_state,
             "state.gripper_state": self._as_state(obs["observation/gripper_position"]),
             "annotation.language.language_instruction": obs.get("prompt", ""),
@@ -167,6 +217,7 @@ class LiberoDreamZeroPolicy:
         return decoded
 
     def infer(self, obs: dict) -> dict:
+        self._ensure_session(obs)
         action_head = self._policy.trained_model.action_head
         if self._debug_open_loop and getattr(action_head, "ip_rank", 0) == 0:
             print(
@@ -182,6 +233,7 @@ class LiberoDreamZeroPolicy:
             result_batch = self._forward(obs)
             video_pred = None
         formatted = self._format_actions(result_batch.act)
+        self._is_first_call = False
         if request_video_pred and video_pred is not None:
             formatted["video_pred"] = self._decode_video_pred(video_pred)
         if self._debug_open_loop and getattr(action_head, "ip_rank", 0) == 0:
@@ -193,7 +245,9 @@ class LiberoDreamZeroPolicy:
         return formatted
 
     def participate(self, obs: dict) -> None:
+        self._ensure_session(obs)
         self._forward(obs)
+        self._is_first_call = False
 
 
 class PicklePolicyServer:

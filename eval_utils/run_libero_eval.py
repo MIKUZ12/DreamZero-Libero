@@ -73,9 +73,10 @@ class DreamZeroLiberoClient:
         host: str,
         port: int,
         open_loop_horizon: int = 8,
-        history_frames: int = 25,
+        history_frames: int = 33,
         debug_open_loop: bool = False,
         return_video_pred: bool = False,
+        reset_server_each_request: bool = False,
     ) -> None:
         if history_frames <= 0:
             raise ValueError(f"history_frames must be positive, got {history_frames}")
@@ -84,6 +85,7 @@ class DreamZeroLiberoClient:
         self.history_frames = history_frames
         self.debug_open_loop = debug_open_loop
         self.return_video_pred = return_video_pred
+        self.reset_server_each_request = reset_server_each_request
         self.actions_from_chunk_completed = 0
         self.pred_action_chunk: np.ndarray | None = None
         self.pred_video_chunks: list[np.ndarray] = []
@@ -91,35 +93,6 @@ class DreamZeroLiberoClient:
         self.request_index = 0
         self.env_step_index = 0
         self._is_first_request = True
-        self._frame_buffers = {
-            "agentview": [],
-            "wrist": [],
-        }
-
-    def _reset_history(self) -> None:
-        for frames in self._frame_buffers.values():
-            frames.clear()
-
-    def _append_history(self, obs: dict) -> None:
-        frame_sources = {
-            "agentview": np.asarray(obs["agentview_image"], dtype=np.uint8),
-            "wrist": np.asarray(obs["robot0_eye_in_hand_image"], dtype=np.uint8),
-        }
-        for key, frame in frame_sources.items():
-            frames = self._frame_buffers[key]
-            frames.append(frame)
-            if len(frames) > self.history_frames:
-                del frames[:-self.history_frames]
-
-    def _stack_recent_frames(self, key: str, num_frames: int) -> np.ndarray:
-        frames = self._frame_buffers[key]
-        if not frames:
-            raise RuntimeError(f"No buffered frames available for {key}")
-        if num_frames <= 0:
-            raise ValueError(f"num_frames must be positive, got {num_frames}")
-
-        padded_frames = [frames[0]] * max(0, num_frames - len(frames)) + frames
-        return np.stack(padded_frames[-num_frames:], axis=0)
 
     def reset(self) -> None:
         if self.debug_open_loop:
@@ -135,25 +108,33 @@ class DreamZeroLiberoClient:
         self.request_index = 0
         self.env_step_index = 0
         self._is_first_request = True
-        self._reset_history()
 
     def infer(self, obs: dict, instruction: str) -> np.ndarray:
-        self._append_history(obs)
         needs_new_chunk = (
             self.actions_from_chunk_completed == 0
             or self.pred_action_chunk is None
             or self.actions_from_chunk_completed >= min(self.open_loop_horizon, len(self.pred_action_chunk))
         )
         if needs_new_chunk:
+            if self.reset_server_each_request and not self._is_first_request:
+                if self.debug_open_loop:
+                    tqdm.write(
+                        f"[client][server-reset-before-request] session={self.session_id} "
+                        f"next_request={self.request_index + 1} env_step={self.env_step_index}"
+                    )
+                # Keep the client-side real observation history, but force the server to
+                # start a fresh chunk for each new request. This avoids the unstable
+                # cross-request continuation path in the action head while preserving
+                # closed-loop rollout against the real environment.
+                self.client.reset(
+                    {
+                        "session_id": self.session_id,
+                        "reason": "new_chunk_request",
+                        "client_env_step_index": self.env_step_index,
+                    }
+                )
             self.actions_from_chunk_completed = 0
             self.request_index += 1
-            # Use the full history length for every request, including the first.
-            # _stack_recent_frames() already left-pads with the earliest frame when
-            # the buffer is still short, which keeps inference aligned with the
-            # train-time 25-frame context and avoids VAE failures on 1-frame inputs.
-            request_frames = self.history_frames
-            agentview_video = self._stack_recent_frames("agentview", request_frames)
-            wrist_video = self._stack_recent_frames("wrist", request_frames)
             eef_state = np.concatenate(
                 [
                     np.asarray(obs["robot0_eef_pos"], dtype=np.float64),
@@ -162,8 +143,8 @@ class DreamZeroLiberoClient:
                 axis=-1,
             )
             request_data = {
-                "observation/exterior_image_0_left": agentview_video,
-                "observation/wrist_image_left": wrist_video,
+                "observation/exterior_image_0_left": np.asarray(obs["agentview_image"], dtype=np.uint8),
+                "observation/wrist_image_left": np.asarray(obs["robot0_eye_in_hand_image"], dtype=np.uint8),
                 "observation/ee_state": eef_state,
                 "observation/gripper_position": np.asarray(obs["robot0_gripper_qpos"], dtype=np.float64),
                 "prompt": instruction,
@@ -177,7 +158,7 @@ class DreamZeroLiberoClient:
                 tqdm.write(
                     f"[client][request] session={self.session_id} request={self.request_index} "
                     f"env_step={self.env_step_index} open_loop_horizon={self.open_loop_horizon} "
-                    f"request_frames={request_frames} history_shape={agentview_video.shape}"
+                    "request_frames=single_frame"
                 )
             result = self.client.infer(request_data)
             self._is_first_request = False
@@ -288,8 +269,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--history-frames",
         type=int,
-        default=25,
-        help="How many recent frames to send per policy request. Default matches LIBERO train-time frame count.",
+        default=33,
+        help="Compatibility knob kept for old result logging. DROID-style LIBERO eval now sends single frames and buffers on the server.",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("./runs/libero_eval"), help="Directory for JSON/CSV results.")
     parser.add_argument("--checkpoint-path", type=Path, default=None, help="Optional checkpoint path recorded in results.json.")
@@ -303,6 +284,16 @@ def parse_args() -> argparse.Namespace:
         "--debug-open-loop",
         action="store_true",
         help="Print detailed client-side request/reuse logs. Disabled by default to keep tqdm readable.",
+    )
+    parser.add_argument(
+        "--reset-server-each-request",
+        action="store_true",
+        help="Force the old LIBERO behavior that resets server cache before each new chunk request.",
+    )
+    parser.add_argument(
+        "--reuse-server-cache-across-requests",
+        action="store_true",
+        help="Deprecated compatibility flag. Cache reuse is now the default DROID-style behavior.",
     )
     parser.add_argument(
         "--video-episodes-per-task",
@@ -330,6 +321,7 @@ def main() -> None:
         history_frames=args.history_frames,
         debug_open_loop=args.debug_open_loop,
         return_video_pred=args.save_video_pred,
+        reset_server_each_request=args.reset_server_each_request,
     )
     tqdm.write(
         f"[eval][start] benchmark={args.benchmark_name} task_ids={task_ids} "
