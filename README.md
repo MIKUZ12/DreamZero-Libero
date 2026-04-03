@@ -1,214 +1,182 @@
 # DreamZero on LIBERO
 
-This repository tracks my current DreamZero adaptation for LIBERO training and evaluation.
+This README documents the current LIBERO path in this checkout of DreamZero.
 
-The codebase now supports:
+The authoritative reference for the training recipe is:
 
-- converting LIBERO raw `hdf5` demonstrations into DreamZero-compatible LeRobot datasets
-- single-task and suite-level LIBERO training
-- chunked LIBERO training aligned with DreamZero's DROID-style temporal sampling
-- checkpoint initialization and true resume from an existing checkpoint
-- official LIBERO closed-loop rollout evaluation through a DreamZero websocket policy server
+That checkpoint corresponds to the suite-level `libero_spatial` chunked recipe:
 
-## Current Recommended Pipeline
+- dataset: `data=dreamzero/libero_spatial_chunked`
+- data root: `data/libero_spatial_lerobot_chunked_ee`
+- views: `video.agentview_rgb`, `video.eye_in_hand_rgb`
+- state: `state.eef_state`, `state.gripper_state`
+- action: `action.pose_delta`, `action.gripper_position`
+- `num_frames=33`
+- `action_horizon=24`
+- `num_views=2`
+- `num_frame_per_block=2`
+- `num_action_per_block=24`
+- `num_state_per_block=1`
+- `max_chunk_size=4`
+- `frame_seqlen=512`
+- `train_architecture=lora`
+- `per_device_train_batch_size=1`
+- `gradient_accumulation_steps=4`
+- `learning_rate=1e-4`
+- `weight_decay=1e-5`
+- `warmup_ratio=0.05`
+- `bf16=true`
+- `tf32=true`
+- `save_lora_only=true`
+- `dataset_shard_sampling_rate=0.1`
+- `num_shards_to_sample=1048576`
+- `max_steps=10000`
+- `save_steps=500`
 
-The most actively maintained LIBERO path in the current code is the single-task chunked workflow:
+## Current Pipeline
 
 ```text
-LIBERO single-task demo.hdf5
-  -> dreamzero/scripts/data/convert_libero_single_task.sh
-  -> data/libero_goal_single_task_lerobot
-  -> dreamzero/scripts/train/libero_single_task_chunked_training.sh
-  -> checkpoint
-  -> dreamzero/scripts/eval/libero_single_task_server.sh
-  -> dreamzero/scripts/eval/libero_single_task_client.sh
+LIBERO suite demo.hdf5 files
+  -> scripts/data/convert_libero.py
+  -> data/libero_spatial_lerobot_chunked_ee
+  -> scripts/train/libero_training.sh
+  -> checkpoints/dreamzero_libero_spatial/checkpoint-*
+  -> scripts/eval/libero_single_task_server.sh
+  -> scripts/eval/libero_single_task_client.sh
   -> official LIBERO rollout
 ```
 
-There are still older or alternative paths in the repo, including:
-
-- `dreamzero/scripts/train/libero_spatial_training.sh`
-- `dreamzero/scripts/train/libero_single_task_training.sh`
-
-Those scripts use the older 25-frame LIBERO setup. The chunked single-task script is the path that is currently closest to the DROID-style training logic.
-
-## What Is Current In This Repo
-
-### Training-side LIBERO setup
-
-For the chunked LIBERO single-task path, the important defaults are:
-
-- benchmark family: `libero_spatial` / LIBERO single-task data
-- observation views:
-  - `video.agentview_rgb`
-  - `video.eye_in_hand_rgb`
-- state:
-  - `state.eef_state`
-  - `state.gripper_state`
-- action:
-  - `action.pose_delta`
-  - `action.gripper_position`
-- action space: `osc_pose`
-- control frequency: `20 Hz`
-- chunked temporal setup:
-  - `num_frames=33`
-  - `action_horizon=24`
-  - `num_frame_per_block=2`
-  - `max_chunk_size=4`
-  - `frame_seqlen=512`
-
-The chunked dataset implementation for LIBERO explicitly reuses the DROID-style sharded chunk sampler while keeping LIBERO's own state/action semantics.
-
-### Evaluation-side LIBERO setup
-
-The current LIBERO evaluation path now follows a DROID-style online protocol:
-
-- the client sends the current observation frame instead of sending a full 33-frame history window
-- the server buffers frames and continues autoregressive inference across requests
-- by default, the server reuses cache across requests
-- the old `history_frames` argument is kept only for compatibility / logging and no longer controls actual policy input construction
-
-In practice:
-
-- first request: server uses 1 frame
-- later requests: server accumulates and uses 4-frame chunks
-- action chunks are still executed with `open_loop_horizon`
-
-## Repository Layout
-
-```text
-.
-|-- dreamzero/
-|   |-- scripts/data/convert_libero.py
-|   |-- scripts/data/convert_libero_single_task.sh
-|   |-- scripts/train/libero_single_task_chunked_training.sh
-|   |-- scripts/eval/libero_single_task_server.sh
-|   |-- scripts/eval/libero_single_task_client.sh
-|   |-- eval_utils/run_libero_server.py
-|   |-- eval_utils/run_libero_eval.py
-|   |-- groot/vla/...
-|-- LIBERO/
-|   |-- official LIBERO codebase
-|-- Dreamzero2libero.md
-|-- Dreamzero2libero_experience.md
-|-- Dreamzero2libero_training_reference.md
-```
-
-## Environment Setup
-
-This workflow usually involves two environments:
-
-- a DreamZero training / policy-server environment
-- a LIBERO rollout environment that can import `libero` correctly
-
-Useful references:
-
-- [dreamzero/README.md](./dreamzero/README.md)
-- [dreamzero/docs/DATASET_TO_GEAR_AND_TRAIN.md](./dreamzero/docs/DATASET_TO_GEAR_AND_TRAIN.md)
-
 ## Data Preparation
 
-### Single-task LIBERO conversion
-
-The simplest current data entry point is:
-
-- [dreamzero/scripts/data/convert_libero_single_task.sh](./dreamzero/scripts/data/convert_libero_single_task.sh)
-
-Example:
-
-```bash
-cd dreamzero
-
-LIBERO_HDF5_PATH=/path/to/task_demo.hdf5 \
-OUTPUT_PATH=./data/libero_goal_single_task_lerobot \
-bash scripts/data/convert_libero_single_task.sh
-```
-
-This wraps [dreamzero/scripts/data/convert_libero.py](./dreamzero/scripts/data/convert_libero.py) and generates:
-
-- a LeRobot-format dataset
-- GEAR metadata such as `meta/modality.json` and `meta/stats.json`
-
-### Suite-level conversion
-
-If you want a suite-style converted dataset rather than a single-task dataset, use:
+Convert the full `libero_spatial` suite into the dataset layout used by `checkpoint-10000`:
 
 ```bash
 cd dreamzero
 
 python scripts/data/convert_libero.py \
-  --suite-path <LIBERO-dataset-root>/libero_spatial \
-  --output-path ./data/libero_spatial_lerobot
+  --suite-path <LIBERO-root>/libero/libero/datasets/libero_spatial \
+  --output-path ./data/libero_spatial_lerobot_chunked_ee
 ```
+
+This generates:
+
+- LeRobot-style episode parquet files
+- encoded videos under `videos/`
+- DreamZero / GEAR metadata under `meta/`
+
+Important note:
+
+- `checkpoint-10000` was trained from the suite-level dataset `data/libero_spatial_lerobot_chunked_ee`
+- it was not trained from the older single-task default path
 
 ## Training
 
-### Recommended current training entry
+The maintained shell entry point in this repo is:
 
-The recommended current training entry is:
+- [`scripts/train/libero_training.sh`](/local/yangshuo/fyhong/dreamzero/scripts/train/libero_training.sh)
 
-- [dreamzero/scripts/train/libero_single_task_chunked_training.sh](./dreamzero/scripts/train/libero_single_task_chunked_training.sh)
+However, if you want to match `checkpoint-10000` literally, use the command below as the reference recipe. This is the safest option because the shell wrapper may drift from the saved checkpoint config over time.
 
-Example:
+### Exact `checkpoint-10000` recipe
 
 ```bash
 cd dreamzero
 
-export LIBERO_DATA_ROOT=./data/libero_goal_single_task_lerobot
-export OUTPUT_DIR=./checkpoints/dreamzero_libero_single_task_chunked
-export NUM_GPUS=4
+export LIBERO_DATA_ROOT=./data/libero_spatial_lerobot_chunked_ee
+export OUTPUT_DIR=./checkpoints/dreamzero_libero_spatial
+export WAN_CKPT_DIR=./checkpoints/Wan2.1-I2V-14B-480P
+export TOKENIZER_DIR=./checkpoints/umt5-xxl
+export NUM_GPUS=8
 
-bash scripts/train/libero_single_task_chunked_training.sh
+torchrun --nproc_per_node "$NUM_GPUS" --standalone groot/vla/experiment/experiment.py \
+  report_to=wandb \
+  data=dreamzero/libero_spatial_chunked \
+  wandb_project=dreamzero \
+  train_architecture=lora \
+  num_frames=33 \
+  action_horizon=24 \
+  num_views=2 \
+  model=dreamzero/vla \
+  model/dreamzero/action_head=wan_flow_matching_action_tf \
+  model/dreamzero/transform=dreamzero_cotrain \
+  num_frame_per_block=2 \
+  num_action_per_block=24 \
+  num_state_per_block=1 \
+  seed=42 \
+  training_args.learning_rate=1e-4 \
+  training_args.deepspeed=groot/vla/configs/deepspeed/zero2.json \
+  save_steps=500 \
+  training_args.warmup_ratio=0.05 \
+  output_dir="$OUTPUT_DIR" \
+  per_device_train_batch_size=1 \
+  gradient_accumulation_steps=4 \
+  max_steps=10000 \
+  weight_decay=1e-5 \
+  save_total_limit=10 \
+  upload_checkpoints=false \
+  bf16=true \
+  tf32=true \
+  eval_bf16=true \
+  dataloader_pin_memory=false \
+  dataloader_num_workers=1 \
+  image_resolution_width_single_frame=256 \
+  image_resolution_height_single_frame=256 \
+  save_lora_only=true \
+  max_chunk_size=4 \
+  dataset_shard_sampling_rate=0.1 \
+  num_shards_to_sample=1048576 \
+  frame_seqlen=512 \
+  save_strategy=steps \
+  libero_data_root="$LIBERO_DATA_ROOT" \
+  dit_version="$WAN_CKPT_DIR" \
+  text_encoder_pretrained_path="$WAN_CKPT_DIR/models_t5_umt5-xxl-enc-bf16.pth" \
+  image_encoder_pretrained_path="$WAN_CKPT_DIR/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth" \
+  vae_pretrained_path="$WAN_CKPT_DIR/Wan2.1_VAE.pth" \
+  tokenizer_path="$TOKENIZER_DIR"
 ```
 
-Key defaults in that script include:
+### About `scripts/train/libero_training.sh`
 
-- `num_frames=33`
-- `action_horizon=24`
-- `num_views=2`
-- `num_frame_per_block=2`
-- `max_chunk_size=4`
-- `frame_seqlen=512`
-- `learning_rate=1e-5`
-- `warmup_ratio=0.05`
-- `weight_decay=1e-5`
-- `bf16=true`
-- `train_architecture=lora`
+`scripts/train/libero_training.sh` is still useful as a wrapper, but treat the checkpoint `conf.yaml` as the source of truth.
 
-### Continuing training from an existing checkpoint
+If you use the wrapper, make sure at minimum that these match the checkpoint recipe:
 
-For initialization from an existing checkpoint:
+- `LIBERO_DATA_ROOT=./data/libero_spatial_lerobot_chunked_ee`
+- `OUTPUT_DIR=./checkpoints/dreamzero_libero_spatial`
+- `FRAME_SEQLEN=512`
+- `MAX_CHUNK_SIZE=4`
+- `NUM_FRAME_PER_BLOCK=2`
+
+If you need a bit-for-bit recipe match, prefer the explicit `torchrun` command above.
+
+### Continuing Training
+
+For weight initialization from an existing checkpoint:
 
 ```bash
 export PRETRAINED_MODEL_PATH=<path-to-checkpoint>
 export RESET_LIBERO_HEADS=false
 ```
 
-If the checkpoint comes from a non-LIBERO setup and you intentionally want fresh LIBERO heads, set:
-
-```bash
-export RESET_LIBERO_HEADS=true
-```
-
-### True resume
-
-The repo now supports explicit true resume through:
+For true optimizer / scheduler / step resume:
 
 ```bash
 export RESUME_FROM_CHECKPOINT=<path-to-checkpoint-dir>
 ```
 
-Use `RESUME_FROM_CHECKPOINT` for optimizer/scheduler/global-step resume.
-Use `PRETRAINED_MODEL_PATH` for weight initialization only.
+Use:
+
+- `PRETRAINED_MODEL_PATH` for initialization only
+- `RESUME_FROM_CHECKPOINT` for true resume
 
 ## Evaluation
 
-### Recommended current evaluation entry
+The current rollout path uses:
 
-The easiest current evaluation path uses the shell wrappers:
+- [`scripts/eval/libero_single_task_server.sh`](/local/yangshuo/fyhong/dreamzero/scripts/eval/libero_single_task_server.sh)
+- [`scripts/eval/libero_single_task_client.sh`](/local/yangshuo/fyhong/dreamzero/scripts/eval/libero_single_task_client.sh)
 
-- [dreamzero/scripts/eval/libero_single_task_server.sh](./dreamzero/scripts/eval/libero_single_task_server.sh)
-- [dreamzero/scripts/eval/libero_single_task_client.sh](./dreamzero/scripts/eval/libero_single_task_client.sh)
+Despite the script names, they are also used for the `libero_spatial` suite.
 
 ### 1. Start the policy server
 
@@ -216,7 +184,7 @@ The easiest current evaluation path uses the shell wrappers:
 cd dreamzero
 
 MODEL_PATH=./checkpoints/dreamzero_libero_spatial/checkpoint-10000 \
-METADATA_DATASET_PATH=./data/libero_goal_single_task_lerobot \
+METADATA_DATASET_PATH=./data/libero_spatial_lerobot_chunked_ee \
 bash scripts/eval/libero_single_task_server.sh
 ```
 
@@ -239,47 +207,38 @@ SAVE_VIDEO_PRED=true \
 bash scripts/eval/libero_single_task_client.sh
 ```
 
-Important notes for the current code:
+Important notes:
 
-- do not rely on `HISTORY_FRAMES` to control actual inference input any more
+- the current eval path uses DROID-style server-side frame buffering
+- `HISTORY_FRAMES` is kept only for compatibility / logging and no longer controls the real client input window
 - use a fresh `OUTPUT_DIR` if you want to preserve previous `results.json`, `results.csv`, rollout videos, and `video_pred` clips
-- `VIDEO_EPISODES_PER_TASK` controls how many episodes per task will save rollout videos and decoded `video_pred` clips
 
-### Outputs
+## Teacher-forced Diagnostics
 
-The evaluation script writes:
+For offline teacher-forced checks against a raw LIBERO demo file:
 
-- `results.json`
-- `results.csv`
-- rollout videos under `videos/...`
-- decoded `video_pred` clips under `video_pred/...`
+```bash
+cd dreamzero
+
+MODEL_PATH=./checkpoints/dreamzero_libero_spatial/checkpoint-10000 \
+DEMO_FILE=<LIBERO-demo-file>.hdf5 \
+METADATA_DATASET_PATH=./data/libero_spatial_lerobot_chunked_ee \
+bash scripts/eval/libero_teacher_forced_open_loop.sh
+```
+
+Here:
+
+- `DEMO_FILE` is the raw LIBERO `*.hdf5` demo file used for teacher-forced offline comparison
+- `METADATA_DATASET_PATH` is the converted DreamZero dataset used for metadata and normalization
 
 ## Important Files
 
-Useful code entry points:
-
-- [dreamzero/scripts/data/convert_libero.py](./dreamzero/scripts/data/convert_libero.py)
-- [dreamzero/scripts/data/convert_libero_single_task.sh](./dreamzero/scripts/data/convert_libero_single_task.sh)
-- [dreamzero/scripts/train/libero_single_task_chunked_training.sh](./dreamzero/scripts/train/libero_single_task_chunked_training.sh)
-- [dreamzero/scripts/eval/libero_single_task_server.sh](./dreamzero/scripts/eval/libero_single_task_server.sh)
-- [dreamzero/scripts/eval/libero_single_task_client.sh](./dreamzero/scripts/eval/libero_single_task_client.sh)
-- [dreamzero/groot/vla/configs/data/dreamzero/libero_spatial_chunked.yaml](./dreamzero/groot/vla/configs/data/dreamzero/libero_spatial_chunked.yaml)
-- [dreamzero/groot/vla/data/dataset/lerobot_sharded.py](./dreamzero/groot/vla/data/dataset/lerobot_sharded.py)
-- [dreamzero/groot/vla/model/dreamzero/transform/dreamzero_cotrain.py](./dreamzero/groot/vla/model/dreamzero/transform/dreamzero_cotrain.py)
-- [dreamzero/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py](./dreamzero/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py)
-- [dreamzero/eval_utils/run_libero_server.py](./dreamzero/eval_utils/run_libero_server.py)
-- [dreamzero/eval_utils/run_libero_eval.py](./dreamzero/eval_utils/run_libero_eval.py)
-
-## Notes
-
-- The repo still contains older 25-frame LIBERO scripts. They are useful for reference, but they are not the best representation of the current chunked single-task path.
-- The current evaluation path is aligned with the local implementation, but a smoke test is still recommended before large-scale runs.
-- If you publish this repository, please clearly state that it is a DreamZero/LIBERO adaptation and that upstream datasets, checkpoints, and licenses remain governed by the original projects.
-
-## Acknowledgements
-
-This repository builds on:
-
-- [DreamZero](https://github.com/dreamzero0/dreamzero)
-- [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO)
-
+- [`scripts/data/convert_libero.py`](/local/yangshuo/fyhong/dreamzero/scripts/data/convert_libero.py)
+- [`scripts/train/libero_training.sh`](/local/yangshuo/fyhong/dreamzero/scripts/train/libero_training.sh)
+- [`groot/vla/configs/data/dreamzero/libero_spatial_chunked.yaml`](/local/yangshuo/fyhong/dreamzero/groot/vla/configs/data/dreamzero/libero_spatial_chunked.yaml)
+- [`groot/vla/configs/data/dreamzero/base_48_wan_fine_aug_relative.yaml`](/local/yangshuo/fyhong/dreamzero/groot/vla/configs/data/dreamzero/base_48_wan_fine_aug_relative.yaml)
+- [`groot/vla/model/dreamzero/transform/dreamzero_cotrain.py`](/local/yangshuo/fyhong/dreamzero/groot/vla/model/dreamzero/transform/dreamzero_cotrain.py)
+- [`groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py`](/local/yangshuo/fyhong/dreamzero/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py)
+- [`eval_utils/run_libero_server.py`](/local/yangshuo/fyhong/dreamzero/eval_utils/run_libero_server.py)
+- [`eval_utils/run_libero_eval.py`](/local/yangshuo/fyhong/dreamzero/eval_utils/run_libero_eval.py)
+- [`checkpoints/dreamzero_libero_spatial/checkpoint-10000/experiment_cfg/conf.yaml`](/local/yangshuo/fyhong/dreamzero/checkpoints/dreamzero_libero_spatial/checkpoint-10000/experiment_cfg/conf.yaml)
